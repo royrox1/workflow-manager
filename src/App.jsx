@@ -1287,8 +1287,6 @@ function AnalyticsPage() {
   const avgConf = confDocs.length ? confDocs.reduce((s, d) => s + d.confidence, 0) / confDocs.length : 0;
   const driveDocs = docs.filter(d => d.source === "drive").length;
 
-  const aC = { CREATE: C.green, UPDATE: C.accent, DELETE: C.red, LOGIN: C.purple, LOGOUT: C.muted, AGENT_RUN: C.amber };
-
   return (
     <div>
       <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: "-0.5px", marginBottom: 6, color: C.text }}>Analytics</div>
@@ -1365,8 +1363,10 @@ function AnalyticsPage() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// AUDIT LOG PAGE
+// AUDIT LOG
 // ═══════════════════════════════════════════════════════════════════════════
+const AUDIT_COLORS = { CREATE: C.green, UPDATE: C.accent, DELETE: C.red, LOGIN: C.purple, LOGOUT: C.muted, AGENT_RUN: C.amber, APPROVE: C.green };
+
 function AuditLogPage() {
   const [logs, setLogs] = useState([]);
   const [filter, setFil] = useState("All");
@@ -1380,8 +1380,7 @@ function AuditLogPage() {
 
   useEffect(() => { reload(); }, [reload]);
 
-  const aC = { CREATE: C.green, UPDATE: C.accent, DELETE: C.red, LOGIN: C.purple, LOGOUT: C.muted, AGENT_RUN: C.amber };
-  const actions = ["All", "CREATE", "UPDATE", "DELETE", "LOGIN", "LOGOUT"];
+  const actions = ["All", ...Array.from(new Set(logs.map(l => l.action)))];
   const filtered = filter === "All" ? logs : logs.filter(l => l.action === filter);
 
   return (
@@ -1391,7 +1390,7 @@ function AuditLogPage() {
 
       <div style={{ display: "flex", gap: 4, marginBottom: 18, flexWrap: "wrap" }}>
         {actions.map(a => (
-          <button key={a} style={{ padding: "6px 12px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 11, fontFamily: "inherit", fontWeight: filter === a ? 700 : 400, background: filter === a ? `${aC[a] || C.accent}22` : "transparent", color: filter === a ? aC[a] || C.accent : C.muted }} onClick={() => setFil(a)}>
+          <button key={a} style={{ padding: "6px 12px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 11, fontFamily: "inherit", fontWeight: filter === a ? 700 : 400, background: filter === a ? `${AUDIT_COLORS[a] || C.accent}22` : "transparent", color: filter === a ? AUDIT_COLORS[a] || C.accent : C.muted }} onClick={() => setFil(a)}>
             {a} ({a === "All" ? logs.length : logs.filter(l => l.action === a).length})
           </button>
         ))}
@@ -1406,10 +1405,10 @@ function AuditLogPage() {
         <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
           {filtered.map(log => (
             <div key={log.id} style={{ ...sx.card, padding: "12px 16px", display: "flex", alignItems: "flex-start", gap: 12 }}>
-              <div style={{ width: 8, height: 8, borderRadius: "50%", background: aC[log.action] || C.muted, marginTop: 5, flexShrink: 0 }} />
+              <div style={{ width: 8, height: 8, borderRadius: "50%", background: AUDIT_COLORS[log.action] || C.muted, marginTop: 5, flexShrink: 0 }} />
               <div style={{ flex: 1 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
-                  <span style={sx.badge(aC[log.action] || C.muted)}>{log.action}</span>
+                  <span style={sx.badge(AUDIT_COLORS[log.action] || C.muted)}>{log.action}</span>
                   <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{log.description}</span>
                 </div>
                 <div style={{ fontSize: 11, color: C.muted, display: "flex", gap: 14, flexWrap: "wrap" }}>
@@ -1510,6 +1509,31 @@ function SettingsModal({ onClose }) {
   );
 }
 
+// ADMIN PANEL STATIC DATA
+const ADMIN_TABS = ["users", "rules", "integrations", "security"];
+const ADMIN_TAB_ICONS = { users: "👥", rules: "⚙️", integrations: "🔗", security: "🔒" };
+
+const INTEGRATIONS_LIST = [
+  { name: "Google Drive", icon: "📁", desc: `Folder ID: ${GDRIVE_FOLDER_ID} — watches for new files`, status: "ready", color: C.amber },
+  { name: "Gmail/Outlook", icon: "📧", desc: "Forward emails to workflow@acmecorp.workflowmanager.io", status: "configured", color: C.green },
+  { name: "Slack", icon: "💬", desc: "Post to #workflow-alerts on task creation and changes", status: "configured", color: C.green },
+  { name: "Microsoft Teams", icon: "🔷", desc: "Send approvals and task assignments via Teams bot", status: "pending", color: C.amber },
+  { name: "SAP ERP", icon: "🏭", desc: "Bidirectional invoice and PO sync", status: "pending", color: C.amber },
+  { name: "Salesforce", icon: "☁️", desc: "Sync contract tasks and approval workflows", status: "not configured", color: C.muted },
+  { name: "JIRA", icon: "🗂", desc: "Mirror workflow tasks as JIRA issues with status sync", status: "not configured", color: C.muted },
+];
+
+const SECURITY_ITEMS = [
+  { label: "SSO / SAML 2.0", status: "Active", color: C.green, detail: IS_DEMO ? "Demo mode — configure real SSO in Supabase Auth settings" : "Supabase Auth · SAML 2.0 / OIDC" },
+  { label: "MFA Enforcement", status: "Enforced", color: C.green, detail: "TOTP + push notifications required for all roles" },
+  { label: "Row-Level Security", status: "Enabled", color: C.green, detail: "Supabase RLS — data isolated per tenant_id on every table" },
+  { label: "Data Encryption", status: "AES-256", color: C.green, detail: "At-rest via Supabase · TLS 1.3 in transit" },
+  { label: "Audit Logging", status: "Active", color: C.green, detail: "Every mutation logged to audit_logs — 200-event buffer in demo" },
+  { label: "IP Allowlisting", status: "Configured", color: C.amber, detail: "10.0.0.0/8, 203.0.113.0/24 — configure in Supabase network rules" },
+  { label: "Session Timeout", status: "30 min", color: C.accent, detail: "Auto-logout on inactivity — configurable per role" },
+  { label: "Data Residency", status: "ap-south-1", color: C.purple, detail: "Supabase project region: Mumbai, India (AWS)" },
+];
+
 // ═══════════════════════════════════════════════════════════════════════════
 // ADMIN PANEL
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1592,18 +1616,15 @@ function AdminPanel() {
     await reload();
   };
 
-  const tabs = ["users", "rules", "integrations", "security"];
-  const tabIcons = { users: "👥", rules: "⚙️", integrations: "🔗", security: "🔒" };
-
   return (
     <div>
       <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: "-0.5px", marginBottom: 6, color: C.text }}>Admin Panel</div>
       <div style={{ fontSize: 12, color: C.muted, marginBottom: 22 }}>Tenant management · RBAC · Integrations · Security</div>
 
       <div style={{ display: "flex", gap: 4, marginBottom: 22 }}>
-        {tabs.map(t => (
+        {ADMIN_TABS.map(t => (
           <button key={t} style={{ padding: "7px 14px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 12, fontFamily: "inherit", fontWeight: tab === t ? 700 : 400, background: tab === t ? `${C.accent}22` : "transparent", color: tab === t ? C.accent : C.muted, letterSpacing: "0.3px" }} onClick={() => setTab(t)}>
-            {tabIcons[t]} {t}
+            {ADMIN_TAB_ICONS[t]} {t}
           </button>
         ))}
       </div>
@@ -1751,15 +1772,7 @@ function AdminPanel() {
       {/* ── INTEGRATIONS ── */}
       {tab === "integrations" && (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {[
-            { name: "Google Drive", icon: "📁", desc: `Folder ID: ${GDRIVE_FOLDER_ID} — watches for new files`, status: gdrive.token ? "connected" : GDRIVE_READY ? "ready" : "not configured", color: gdrive.token ? C.green : GDRIVE_READY ? C.amber : C.muted },
-            { name: "Gmail/Outlook", icon: "📧", desc: "Forward emails to workflow@acmecorp.workflowmanager.io", status: "configured", color: C.green },
-            { name: "Slack", icon: "💬", desc: "Post to #workflow-alerts on task creation and changes", status: "configured", color: C.green },
-            { name: "Microsoft Teams", icon: "🔷", desc: "Send approvals and task assignments via Teams bot", status: "pending", color: C.amber },
-            { name: "SAP ERP", icon: "🏭", desc: "Bidirectional invoice and PO sync", status: "pending", color: C.amber },
-            { name: "Salesforce", icon: "☁️", desc: "Sync contract tasks and approval workflows", status: "not configured", color: C.muted },
-            { name: "JIRA", icon: "🗂", desc: "Mirror workflow tasks as JIRA issues with status sync", status: "not configured", color: C.muted },
-          ].map(int => (
+          {INTEGRATIONS_LIST.map(int => (
             <div key={int.name} style={{ ...sx.card, padding: "14px 18px", display: "flex", alignItems: "center", gap: 14 }}>
               <div style={{ fontSize: 26 }}>{int.icon}</div>
               <div style={{ flex: 1 }}>
@@ -1776,16 +1789,7 @@ function AdminPanel() {
       {/* ── SECURITY ── */}
       {tab === "security" && (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {[
-            { label: "SSO / SAML 2.0", status: "Active", color: C.green, detail: IS_DEMO ? "Demo mode — configure real SSO in Supabase Auth settings" : "Supabase Auth · SAML 2.0 / OIDC" },
-            { label: "MFA Enforcement", status: "Enforced", color: C.green, detail: "TOTP + push notifications required for all roles" },
-            { label: "Row-Level Security", status: "Enabled", color: C.green, detail: "Supabase RLS — data isolated per tenant_id on every table" },
-            { label: "Data Encryption", status: "AES-256", color: C.green, detail: "At-rest via Supabase · TLS 1.3 in transit" },
-            { label: "Audit Logging", status: "Active", color: C.green, detail: "Every mutation logged to audit_logs — 200-event buffer in demo" },
-            { label: "IP Allowlisting", status: "Configured", color: C.amber, detail: "10.0.0.0/8, 203.0.113.0/24 — configure in Supabase network rules" },
-            { label: "Session Timeout", status: "30 min", color: C.accent, detail: "Auto-logout on inactivity — configurable per role" },
-            { label: "Data Residency", status: "ap-south-1", color: C.purple, detail: "Supabase project region: Mumbai, India (AWS)" },
-          ].map(item => (
+          {SECURITY_ITEMS.map(item => (
             <div key={item.label} style={{ ...sx.card, padding: "14px 18px", display: "flex", alignItems: "center", gap: 14 }}>
               <div style={{ flex: 1 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
@@ -1846,7 +1850,7 @@ export default function App() {
 
   const roleConf = ROLES[user.role] || ROLES.Viewer;
   const activePage = roleConf.pages.includes(page) ? page : roleConf.pages[0];
-  const pageIcons = { Documents: "📄", Tasks: "✅", Workflow: "🔀", Analytics: "📊", Audit: "📋", Admin: "🔑" };
+  const PAGE_ICONS = { Documents: "📄", Tasks: "✅", Workflow: "🔀", Analytics: "📊", Audit: "📋", Admin: "🔑" };
 
   return (
     <AuthCtx.Provider value={{ user, perms: roleConf }}>
@@ -1877,7 +1881,7 @@ export default function App() {
             <nav style={{ display: "flex", gap: 2, flexWrap: "wrap", justifyContent: "center" }}>
               {roleConf.pages.map(p => (
                 <button key={p} style={{ padding: "6px 11px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 11, fontFamily: "inherit", fontWeight: activePage === p ? 700 : 400, letterSpacing: "0.3px", background: activePage === p ? `${C.accent}22` : "transparent", color: activePage === p ? C.accent : C.muted, transition: "all .15s" }} onClick={() => setPage(p)}>
-                  {pageIcons[p]} {p}
+                  {PAGE_ICONS[p]} {p}
                 </button>
               ))}
             </nav>
