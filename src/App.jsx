@@ -283,6 +283,7 @@ function buildSupabaseDB(url, key) {
     updateRule: async (id, fields) => (await upd("workflow_rules", id, fields))[0],
     deleteRule: async (id) => del("workflow_rules", id),
   };
+
 }
 
 // singleton — stable across re-renders, created once at module load
