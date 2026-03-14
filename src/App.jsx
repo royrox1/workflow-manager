@@ -292,10 +292,22 @@ const DB = IS_DEMO ? buildDemoDB() : buildSupabaseDB(SUPABASE_URL, SUPABASE_ANON
 // ═══════════════════════════════════════════════════════════════════════════
 // AI RELIABILITY LAYER — retry · fallback model · confidence threshold
 // ═══════════════════════════════════════════════════════════════════════════
-const defaultLlmConfig = { provider: "anthropic", baseUrl: "https://api.anthropic.com/v1", apiKey: "", model: "claude-3-5-sonnet-20241022" };
+const defaultLlmConfig = {
+  provider: import.meta.env.VITE_LLM_PROVIDER || "anthropic",
+  baseUrl: import.meta.env.VITE_LLM_BASE_URL || "https://api.anthropic.com/v1",
+  apiKey: import.meta.env.VITE_LLM_API_KEY || "",
+  model: import.meta.env.VITE_LLM_MODEL || "claude-3-5-sonnet-20241022"
+};
 let llmConfig = null;
 try {
-  llmConfig = JSON.parse(localStorage.getItem("workflow_llm_config")) || defaultLlmConfig;
+  llmConfig = JSON.parse(localStorage.getItem("workflow_llm_config"));
+  // Merge defaults to ensure we pick up ANY env variables if missing from local storage
+  if (!llmConfig) {
+    llmConfig = defaultLlmConfig;
+  } else if (!llmConfig.apiKey && defaultLlmConfig.apiKey) {
+    // Re-apply API key from env if user hasn't set it in local storage, to allow env-based overrides
+    llmConfig.apiKey = defaultLlmConfig.apiKey;
+  }
 } catch (e) {
   llmConfig = defaultLlmConfig;
 }
@@ -1300,8 +1312,8 @@ function AnalyticsPage() {
       )}
 
       <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
-        <KPI label="Docs Processed" value={docs.filter(d => d.status === "Processed").length} sub={`of ${docs.length} total`} icon="📄" color={C.accent} />
-        <KPI label="Tasks Created" value={tasks.length} sub="AI auto-generated" icon="⚡" color={C.green} />
+        <KPI label="Docs Processed" value={(docs || []).filter(d => d.status === "Processed").length} sub={`of ${(docs || []).length} total`} icon="📄" color={C.accent} />
+        <KPI label="Tasks Created" value={(tasks || []).length} sub="AI auto-generated" icon="⚡" color={C.green} />
         <KPI label="AI Handled" value={`${safePct(aiDone, total || 1)}%`} sub="of completed tasks" icon="🤖" color={C.purple} />
         <KPI label="Avg Confidence" value={`${Math.round(avgConf * 100)}%`} sub="AI extraction accuracy" icon="🎯" color={C.amber} />
         <KPI label="SLA Breaches" value={overdue} sub="overdue & incomplete" icon="🚨" color={overdue > 0 ? C.red : C.green} />
@@ -1461,6 +1473,32 @@ function SettingsModal({ onClose }) {
   const inp = { ...sx.input, marginBottom: 16 };
   const lbl = { ...sx.label, fontSize: 10 };
 
+  const MODEL_OPTIONS = {
+    anthropic: [
+      "claude-3-5-sonnet-20241022",
+      "claude-3-5-haiku-20241022",
+      "claude-3-opus-20240229",
+      "claude-3-sonnet-20240229",
+      "claude-3-haiku-20240307"
+    ],
+    openai: [
+      "gpt-4o",
+      "gpt-4o-mini",
+      "o1-preview",
+      "o1-mini",
+      "gpt-4-turbo"
+    ],
+    ollama: [
+      "llama3.2",
+      "llama3.1",
+      "mistral",
+      "gemma2",
+      "phi3"
+    ]
+  };
+
+  const currentModels = MODEL_OPTIONS[conf.provider] || MODEL_OPTIONS.openai;
+
   return (
     <Modal onClose={onClose} maxWidth={500}>
       <div style={{ padding: "18px 24px 14px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -1481,7 +1519,21 @@ function SettingsModal({ onClose }) {
         <input value={conf.baseUrl} onChange={e => saveConf("baseUrl", e.target.value)} placeholder={conf.provider === "ollama" ? "http://localhost:11434/v1" : "e.g. https://api.openai.com/v1"} style={inp} />
 
         <span style={lbl}>Model Name</span>
-        <input value={conf.model} onChange={e => saveConf("model", e.target.value)} placeholder={conf.provider === "ollama" ? "e.g. llama3.2" : "e.g. gpt-4o"} style={inp} />
+        {conf.provider === "ollama" ? (
+          <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+            <select value={currentModels.includes(conf.model) ? conf.model : ""} onChange={e => e.target.value && saveConf("model", e.target.value)} style={{ ...sx.input, cursor: "pointer", appearance: "auto", flex: 1 }}>
+              <option value="" disabled>Select popular...</option>
+              {currentModels.map(m => <option key={m} value={m}>{m}</option>)}
+            </select>
+            <input value={conf.model} onChange={e => saveConf("model", e.target.value)} placeholder="Or type custom model..." style={{ ...sx.input, flex: 1 }} />
+          </div>
+        ) : (
+          <select value={conf.model} onChange={e => saveConf("model", e.target.value)} style={{ ...inp, cursor: "pointer", appearance: "auto" }}>
+            {currentModels.map(m => <option key={m} value={m}>{m}</option>)}
+            {/* Allow existing custom models to show up if loaded from env/storage */}
+            {!currentModels.includes(conf.model) && conf.model && <option value={conf.model}>{conf.model} (Custom)</option>}
+          </select>
+        )}
 
         {conf.provider !== "ollama" && (
           <>
