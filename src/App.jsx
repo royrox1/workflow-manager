@@ -181,6 +181,11 @@ function buildDemoDB() {
       { id: "r3", tenant_id: "acmecorp", trigger_condition: "AI confidence < 85%", action_description: "Escalate to human review, flag task", active: true, status: "active", version: 3, created_by: "u1", approved_by: "u1" },
       { id: "r4", tenant_id: "acmecorp", trigger_condition: "Task overdue > 2 days", action_description: "Notify manager + re-assign to backup", active: false, status: "draft", version: 1, created_by: "u2", approved_by: null },
     ],
+    agents: [
+      { id: "a1", tenant_id: "acmecorp", name: "DocSummarizer", role: "Summarization", system_prompt: "You are a professional documentation summarizer. Provide a concise, executive summary of the document provided, focusing on key takeaways and action items.", model: "claude-3-5-sonnet-20241022", icon: "📝" },
+      { id: "a2", tenant_id: "acmecorp", name: "RiskAnalyzer", role: "Risk Analysis", system_prompt: "You are a legal and financial risk analysis agent. Identify potential liabilities, unusual clauses, or high-cost items in the provided text. Flash red flags where necessary.", model: "claude-3-5-sonnet-20241022", icon: "🚨" },
+      { id: "a3", tenant_id: "acmecorp", name: "TaskExtractor", role: "Workflow Automation", system_prompt: "You are a workflow optimization agent. Extract specific, actionable tasks from the document. Create exactly 3 tasks with clear priorities.", model: "gpt-4o", icon: "⚡" },
+    ],
   };
 
   return {
@@ -218,6 +223,12 @@ function buildDemoDB() {
     insertRule: async (rule) => { const r = { id: uid(), ...rule }; store.workflow_rules.push(r); return { ...r }; },
     updateRule: async (id, fields) => { const i = store.workflow_rules.findIndex(r => r.id === id); if (i > -1) Object.assign(store.workflow_rules[i], fields); return { ...store.workflow_rules[i] }; },
     deleteRule: async (id) => { store.workflow_rules = store.workflow_rules.filter(r => r.id !== id); },
+
+    // ── Agents ─────────────────────────────────────────────────────────────
+    getAgents: async (tid) => store.agents.filter(a => a.tenant_id === tid).map(a => ({ ...a })),
+    insertAgent: async (agent) => { const a = { id: uid(), ...agent }; store.agents.push(a); return { ...a }; },
+    updateAgent: async (id, fields) => { const i = store.agents.findIndex(a => a.id === id); if (i > -1) Object.assign(store.agents[i], fields); return { ...store.agents[i] }; },
+    deleteAgent: async (id) => { store.agents = store.agents.filter(a => a.id !== id); },
   };
 }
 
@@ -282,6 +293,11 @@ function buildSupabaseDB(url, key) {
     insertRule: async (rule) => (await ins("workflow_rules", rule))[0],
     updateRule: async (id, fields) => (await upd("workflow_rules", id, fields))[0],
     deleteRule: async (id) => del("workflow_rules", id),
+
+    getAgents: async (tid) => q("agents", { tenant_id: `eq.${tid}`, order: "name.asc" }),
+    insertAgent: async (agent) => (await ins("agents", agent))[0],
+    updateAgent: async (id, fields) => (await upd("agents", id, fields))[0],
+    deleteAgent: async (id) => del("agents", id),
   };
 
 }
@@ -403,9 +419,14 @@ Rules: max 3 tasks, keep strings concise, confidence reflects extraction quality
   return { ...parsed, _meta: { model: result.model, attempts: result.attempts } };
 }
 
-async function runAgentOnTask(task) {
-  const sys = `You are an enterprise AI workflow agent. Execute the assigned task and write a 2-4 sentence professional report: what you did, what data you processed, and the outcome. Be specific.`;
-  const res = await callLLM(sys, `Task: ${task.title}\nDescription: ${task.description}\nPriority: ${task.priority}`);
+async function runAgentOnTask(task, customAgent = null) {
+  const sys = customAgent?.system_prompt || `You are an enterprise AI workflow agent. Execute the assigned task and write a 2-4 sentence professional report: what you did, what data you processed, and the outcome. Be specific.`;
+  const preferredModel = customAgent?.model;
+  
+  // Use customAgent model if specified, otherwise fall back to global config
+  const res = await callLLM(sys, `Task: ${task.title}\nDescription: ${task.description}\nPriority: ${task.priority}`, {
+    ...(preferredModel ? { model: preferredModel } : {})
+  });
   return { report: res.text.trim(), model: res.model, attempts: res.attempts };
 }
 
@@ -622,7 +643,7 @@ function MetaCell({ label, children }) {
 // TASK MODAL
 // FIX: useAuth called at top level (not inside JSX); state resets when task changes
 // ═══════════════════════════════════════════════════════════════════════════
-function TaskModal({ task, doc, onClose, onRunAgent, onUpdate, runningId }) {
+function TaskModal({ task, doc, agents = [], onClose, onRunAgent, onUpdate, runningId }) {
   const { user, perms } = useAuth(); // ← always at top level, never inside JSX
   const isRunning = runningId === task.id;
 
@@ -696,7 +717,17 @@ function TaskModal({ task, doc, onClose, onRunAgent, onUpdate, runningId }) {
           <MetaCell label="👤 Assignee">
             {perms.canEditTasks
               ? <select value={assignee} onChange={e => setAsgn(e.target.value)} style={{ ...inp, padding: "5px 8px", cursor: "pointer" }}>
-                {["AI Agent", "Operations Team", "Manager", "Finance Team"].map(a => <option key={a}>{a}</option>)}
+                <optgroup label="System">
+                  <option>AI Agent</option>
+                  <option>Operations Team</option>
+                  <option>Manager</option>
+                  <option>Finance Team</option>
+                </optgroup>
+                {agents.length > 0 && (
+                  <optgroup label="Custom Agents">
+                    {agents.map(a => <option key={a.id} value={a.name}>{a.icon} {a.name}</option>)}
+                  </optgroup>
+                )}
               </select>
               : <div style={{ fontSize: 13, color: C.text, paddingTop: 3 }}>{assignee}</div>
             }
@@ -768,9 +799,9 @@ function TaskModal({ task, doc, onClose, onRunAgent, onUpdate, runningId }) {
         {/* Actions */}
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", paddingTop: 4, borderTop: `1px solid ${C.border}` }}>
           {perms.canEditTasks && <button style={sx.btn("primary")} onClick={save}>{saved ? "✓ Saved!" : "💾 Save Changes"}</button>}
-          {assignee === "AI Agent" && status !== "Done" && perms.canRunAgent && (
+          {(assignee === "AI Agent" || agents.some(a => a.name === assignee)) && status !== "Done" && perms.canRunAgent && (
             <button style={sx.btn("green")} onClick={() => onRunAgent(task)} disabled={isRunning}>
-              {isRunning ? <><Spinner /> Running…</> : "⚡ Run AI Agent"}
+              {isRunning ? <><Spinner /> Running…</> : `⚡ Run ${assignee.includes("Agent") ? "Agent" : assignee}`}
             </button>
           )}
           {status !== "Done" && perms.canEditTasks && (
@@ -1041,13 +1072,14 @@ function TasksPage() {
   const addAudit = useAudit();
   const [tasks, setTasks] = useState([]);
   const [docs, setDocs] = useState([]);
+  const [agents, setAgents] = useState([]);
   const [filter, setFilter] = useState("All");
   const [selected, setSel] = useState(null);
   const [runningId, setRun] = useState(null);
 
   const reload = useCallback(async () => {
-    const [t, d] = await Promise.all([DB.getTasks("acmecorp"), DB.getDocs("acmecorp")]);
-    setTasks(t); setDocs(d);
+    const [t, d, a] = await Promise.all([DB.getTasks("acmecorp"), DB.getDocs("acmecorp"), DB.getAgents("acmecorp")]);
+    setTasks(t); setDocs(d); setAgents(a);
   }, []);
 
   useEffect(() => { reload(); }, [reload]);
@@ -1058,7 +1090,8 @@ function TasksPage() {
     await DB.updateTask(task.id, { status: "In Progress" });
     await addAudit("UPDATE", "Task", task.id, `AI agent started: "${task.title}"`);
     try {
-      const { report, model, attempts } = await runAgentOnTask(task);
+      const customAgent = agents.find(a => a.name === task.assignee);
+      const { report, model, attempts } = await runAgentOnTask(task, customAgent);
       await DB.updateTask(task.id, { status: "Done", agent_log: report, agent_meta: { model, attempts } });
       await addAudit("UPDATE", "Task", task.id, `AI agent completed: "${task.title}"`, { model });
     } catch (e) {
@@ -1090,7 +1123,7 @@ function TasksPage() {
 
   return (
     <div>
-      {selected && <TaskModal task={selected} doc={selDoc} onClose={() => setSel(null)} onRunAgent={runAgent} onUpdate={updateTask} runningId={runningId} />}
+      {selected && <TaskModal task={selected} doc={selDoc} agents={agents} onClose={() => setSel(null)} onRunAgent={runAgent} onUpdate={updateTask} runningId={runningId} />}
 
       <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: "-0.5px", marginBottom: 6, color: C.text }}>Task Management</div>
       <div style={{ fontSize: 12, color: C.muted, marginBottom: 22 }}>{tasks.length} tasks · AI-generated · Click any task to view & edit · Role: <span style={{ color: ROLES[user.role]?.color }}>{user.role}</span></div>
@@ -1121,7 +1154,7 @@ function TasksPage() {
                 </div>
                 <div style={{ fontSize: 12, color: C.muted, marginBottom: 6, lineHeight: 1.4 }}>{task.description}</div>
                 <div style={{ fontSize: 11, color: C.dim, display: "flex", gap: 12, flexWrap: "wrap" }}>
-                  <span>{task.assignee === "AI Agent" ? "🤖" : "👤"} {task.assignee}</span>
+                  <span>{task.assignee === "AI Agent" || agents.some(a => a.name === task.assignee) ? (agents.find(a => a.name === task.assignee)?.icon || "🤖") : "👤"} {task.assignee}</span>
                   {task.due_in_days > 0 && <span style={{ color: task.due_in_days <= 1 ? C.red : C.muted }}>⏰ {task.due_in_days}d</span>}
                   <span>🕐 {fmt(task.created_at)}</span>
                   {(task.tags || []).map(tag => <span key={tag} style={{ background: C.dim, color: C.muted, padding: "1px 5px", borderRadius: 3, fontSize: 10 }}>#{tag}</span>)}
@@ -1193,12 +1226,13 @@ function WorkflowPage() {
   const addAudit = useAudit();
   const [tasks, setTasks] = useState([]);
   const [docs, setDocs] = useState([]);
+  const [agents, setAgents] = useState([]);
   const [selected, setSel] = useState(null);
   const [runningId, setRun] = useState(null);
 
   const reload = useCallback(async () => {
-    const [t, d] = await Promise.all([DB.getTasks("acmecorp"), DB.getDocs("acmecorp")]);
-    setTasks(t); setDocs(d);
+    const [t, d, a] = await Promise.all([DB.getTasks("acmecorp"), DB.getDocs("acmecorp"), DB.getAgents("acmecorp")]);
+    setTasks(t); setDocs(d); setAgents(a);
   }, []);
 
   useEffect(() => { reload(); }, [reload]);
@@ -1208,7 +1242,8 @@ function WorkflowPage() {
     await DB.updateTask(task.id, { status: "In Progress" });
     await addAudit("UPDATE", "Task", task.id, `AI agent started: "${task.title}"`);
     try {
-      const { report, model, attempts } = await runAgentOnTask(task);
+      const customAgent = agents.find(a => a.name === task.assignee);
+      const { report, model, attempts } = await runAgentOnTask(task, customAgent);
       await DB.updateTask(task.id, { status: "Done", agent_log: report, agent_meta: { model, attempts } });
       await addAudit("UPDATE", "Task", task.id, `Agent completed: "${task.title}"`, { model });
     } catch (e) {
@@ -1226,13 +1261,13 @@ function WorkflowPage() {
     if (selected?.id === id) setSel(p => ({ ...p, ...fields }));
   };
 
-  const aiTasks = tasks.filter(t => t.assignee === "AI Agent");
-  const humanTasks = tasks.filter(t => t.assignee !== "AI Agent");
+  const aiTasks = tasks.filter(t => t.assignee === "AI Agent" || agents.some(a => a.name === t.assignee));
+  const humanTasks = tasks.filter(t => !aiTasks.includes(t));
   const stages = [["📥", "Uploaded", docs.length], ["🤖", "Processed", docs.filter(d => d.status === "Processed").length], ["⚡", "Tasks", tasks.length], ["👤", "Assigned", tasks.filter(t => t.assignee).length], ["▶", "Active", tasks.filter(t => ["In Progress", "Done"].includes(t.status)).length], ["✅", "Done", tasks.filter(t => t.status === "Done").length]];
 
   return (
     <div>
-      {selected && <TaskModal task={selected} doc={docs.find(d => d.id === selected.doc_id)} onClose={() => setSel(null)} onRunAgent={runAgent} onUpdate={updateTask} runningId={runningId} />}
+      {selected && <TaskModal task={selected} doc={docs.find(d => d.id === selected.doc_id)} agents={agents} onClose={() => setSel(null)} onRunAgent={runAgent} onUpdate={updateTask} runningId={runningId} />}
 
       <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: "-0.5px", marginBottom: 6, color: C.text }}>Workflow</div>
       <div style={{ fontSize: 12, color: C.muted, marginBottom: 22 }}>Live pipeline · AI and human task lanes · Click any task for details</div>
@@ -1260,6 +1295,8 @@ function WorkflowPage() {
     </div>
   );
 }
+
+const AUDIT_COLORS = { CREATE: C.green, UPDATE: C.accent, DELETE: C.red, LOGIN: C.purple, LOGOUT: C.muted, AGENT_RUN: C.amber, APPROVE: C.green };
 
 function KPI({ label, value, sub, color, icon }) {
   return (
@@ -1362,7 +1399,7 @@ function AnalyticsPage() {
           {logs.length === 0 && <div style={{ fontSize: 12, color: C.muted, textAlign: "center", padding: "16px 0" }}>No events yet</div>}
           {logs.slice(0, 7).map(log => (
             <div key={log.id} style={{ display: "flex", gap: 8, marginBottom: 10, alignItems: "flex-start" }}>
-              <div style={{ width: 6, height: 6, borderRadius: "50%", background: aC[log.action] || C.muted, marginTop: 5, flexShrink: 0 }} />
+              <div style={{ width: 6, height: 6, borderRadius: "50%", background: AUDIT_COLORS[log.action] || C.muted, marginTop: 5, flexShrink: 0 }} />
               <div>
                 <div style={{ fontSize: 11, color: C.text, lineHeight: 1.4 }}>{log.description}</div>
                 <div style={{ fontSize: 10, color: C.muted }}>{log.user_name || "system"} · {fmt(log.created_at)}</div>
@@ -1378,7 +1415,7 @@ function AnalyticsPage() {
 // ═══════════════════════════════════════════════════════════════════════════
 // AUDIT LOG
 // ═══════════════════════════════════════════════════════════════════════════
-const AUDIT_COLORS = { CREATE: C.green, UPDATE: C.accent, DELETE: C.red, LOGIN: C.purple, LOGOUT: C.muted, AGENT_RUN: C.amber, APPROVE: C.green };
+
 
 function AuditLogPage() {
   const [logs, setLogs] = useState([]);
@@ -1563,8 +1600,8 @@ function SettingsModal({ onClose }) {
 }
 
 // ADMIN PANEL STATIC DATA
-const ADMIN_TABS = ["users", "rules", "integrations", "security"];
-const ADMIN_TAB_ICONS = { users: "👥", rules: "⚙️", integrations: "🔗", security: "🔒" };
+const ADMIN_TABS = ["users", "agents", "rules", "integrations", "security"];
+const ADMIN_TAB_ICONS = { users: "👥", agents: "🤖", rules: "⚙️", integrations: "🔗", security: "🔒" };
 
 const INTEGRATIONS_LIST = [
   { name: "Google Drive", icon: "📁", desc: `Folder ID: ${GDRIVE_FOLDER_ID} — watches for new files`, status: "ready", color: C.amber },
@@ -1595,15 +1632,20 @@ function AdminPanel() {
   const addAudit = useAudit();
   const [tab, setTab] = useState("users");
   const [profiles, setProfiles] = useState([]);
+  const [agents, setAgents] = useState([]);
   const [rules, setRules] = useState([]);
   const [newUser, setNewUser] = useState({ full_name: "", email: "", role: "Viewer", department: "" });
+  const [newAgent, setNewAgent] = useState({ name: "", role: "", system_prompt: "", model: "claude-3-5-sonnet-20241022", icon: "🤖" });
+  const [addingAgent, setAddingAgent] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [editAgentId, setEditAgent] = useState(null);
+  const [editAgentData, setEditAgentData] = useState({});
   const [editRuleId, setEditRule] = useState(null);
   const [editRuleData, setEditRuleData] = useState({});
 
   const reload = useCallback(async () => {
-    const [p, r] = await Promise.all([DB.getProfiles("acmecorp"), DB.getRules("acmecorp")]);
-    setProfiles(p); setRules(r);
+    const [p, r, a] = await Promise.all([DB.getProfiles("acmecorp"), DB.getRules("acmecorp"), DB.getAgents("acmecorp")]);
+    setProfiles(p); setRules(r); setAgents(a);
   }, []);
 
   useEffect(() => { reload(); }, [reload]);
@@ -1630,6 +1672,31 @@ function AdminPanel() {
     if (!window.confirm(`Remove ${p?.full_name} from the workspace? This cannot be undone.`)) return;
     await DB.deleteProfile(id);
     await addAudit("DELETE", "User", id, `Removed user ${p?.full_name}`);
+    await reload();
+  };
+
+  const addAgent = async () => {
+    if (!newAgent.name.trim() || !newAgent.system_prompt.trim()) return;
+    const a = { ...newAgent, tenant_id: "acmecorp" };
+    await DB.insertAgent(a);
+    await addAudit("CREATE", "Agent", a.id || "new", `Created agent ${a.name}`);
+    setNewAgent({ name: "", role: "", system_prompt: "", model: "claude-3-5-sonnet-20241022", icon: "🤖" });
+    setAddingAgent(false);
+    await reload();
+  };
+
+  const removeAgent = async (id) => {
+    const a = agents.find(x => x.id === id);
+    if (!window.confirm(`Delete agent ${a?.name}?`)) return;
+    await DB.deleteAgent(id);
+    await addAudit("DELETE", "Agent", id, `Deleted agent ${a?.name}`);
+    await reload();
+  };
+
+  const saveAgent = async (id) => {
+    await DB.updateAgent(id, editAgentData);
+    await addAudit("UPDATE", "Agent", id, `Updated agent ${editAgentData.name || id}`);
+    setEditAgent(null); setEditAgentData({});
     await reload();
   };
 
@@ -1756,6 +1823,95 @@ function AdminPanel() {
                 </tbody>
               </table>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── AGENTS ── */}
+      {tab === "agents" && (
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{agents.length} custom agents</div>
+            <button style={sx.btn("primary")} onClick={() => setAddingAgent(true)}>+ New Agent</button>
+          </div>
+
+          {addingAgent && (
+            <div style={{ ...sx.card, marginBottom: 14, borderColor: C.accent }}>
+              <span style={sx.label}>Define New Agent</span>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+                <div>
+                  <span style={sx.label}>Agent Name</span>
+                  <input value={newAgent.name} onChange={e => setNewAgent(p => ({ ...p, name: e.target.value }))} style={sx.input} placeholder="e.g. LegalReviewer" />
+                </div>
+                <div>
+                  <span style={sx.label}>Specialty / Role</span>
+                  <input value={newAgent.role} onChange={e => setNewAgent(p => ({ ...p, role: e.target.value }))} style={sx.input} placeholder="e.g. Contract Analysis" />
+                </div>
+                <div style={{ gridColumn: "span 2" }}>
+                  <span style={sx.label}>System Prompt</span>
+                  <textarea value={newAgent.system_prompt} onChange={e => setNewAgent(p => ({ ...p, system_prompt: e.target.value }))} style={{ ...sx.input, resize: "vertical" }} rows={3} placeholder="Define instructions for the agent..." />
+                </div>
+                <div>
+                  <span style={sx.label}>Preferred Model</span>
+                  <select value={newAgent.model} onChange={e => setNewAgent(p => ({ ...p, model: e.target.value }))} style={{ ...sx.input, cursor: "pointer" }}>
+                    <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet</option>
+                    <option value="gpt-4o">GPT-4o</option>
+                    <option value="llama3.2">Llama 3.2 (Ollama)</option>
+                  </select>
+                </div>
+                <div>
+                  <span style={sx.label}>Icon</span>
+                  <input value={newAgent.icon} onChange={e => setNewAgent(p => ({ ...p, icon: e.target.value }))} style={sx.input} placeholder="Emoji icon" />
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button style={sx.btn("green")} onClick={addAgent}>✓ Create Agent</button>
+                <button style={sx.btn("ghost")} onClick={() => setAddingAgent(false)}>Cancel</button>
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {agents.map(a => {
+              const isEditing = editAgentId === a.id;
+              return (
+                <div key={a.id} style={{ ...sx.card, padding: "14px 18px" }}>
+                  <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+                    <div style={{ fontSize: 24 }}>{a.icon}</div>
+                    <div style={{ flex: 1 }}>
+                      {isEditing ? (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                          <input value={editAgentData.name ?? a.name} onChange={e => setEditAgentData(p => ({ ...p, name: e.target.value }))} style={sx.input} />
+                          <textarea value={editAgentData.system_prompt ?? a.system_prompt} onChange={e => setEditAgentData(p => ({ ...p, system_prompt: e.target.value }))} style={{ ...sx.input, resize: "vertical" }} rows={3} />
+                        </div>
+                      ) : (
+                        <>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{a.name} <span style={{ fontWeight: 400, color: C.muted, marginLeft: 6 }}>· {a.role}</span></div>
+                          <div style={{ fontSize: 11, color: C.muted, marginTop: 4, fontStyle: "italic", lineHeight: 1.4 }}>"{a.system_prompt.slice(0, 80)}..."</div>
+                        </>
+                      )}
+                      <div style={{ fontSize: 10, color: C.accent, marginTop: 6, display: "flex", gap: 10 }}>
+                        <span>🧠 {a.model}</span>
+                        <span>🆔 {a.id}</span>
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {isEditing ? (
+                        <>
+                          <button style={{ ...sx.btn("green"), padding: "4px 10px", fontSize: 11 }} onClick={() => saveAgent(a.id)}>💾 Save</button>
+                          <button style={{ ...sx.btn("ghost"), padding: "4px 10px", fontSize: 11 }} onClick={() => { setEditAgent(null); setEditAgentData({}); }}>Cancel</button>
+                        </>
+                      ) : (
+                        <>
+                          <button style={{ ...sx.btn("ghost"), padding: "4px 10px", fontSize: 11 }} onClick={() => { setEditAgent(a.id); setEditAgentData(a); }}>Edit</button>
+                          <button onClick={() => removeAgent(a.id)} style={{ background: "none", border: "none", color: C.red, cursor: "pointer", fontSize: 14, opacity: 0.65 }}>✕</button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
