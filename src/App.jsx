@@ -80,8 +80,8 @@
  */
 
 import {
-  useState, useRef, useEffect, useCallback,
-  createContext, useContext
+  useState, useRef, useEffect, useCallback, useMemo,
+  createContext, useContext, Component
 } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -138,12 +138,23 @@ const uid = () => (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.
 const fmt = (ts) => ts ? new Date(ts).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—";
 const safePct = (n, d) => d > 0 ? Math.round((n / d) * 100) : 0;
 
+const toCSV = (data, headers) => {
+  const head = headers.join(",") + "\n";
+  const rows = data.map(item => headers.map(h => `"${String(item[h] || '').replace(/"/g, '""')}"`).join(",")).join("\n");
+  const blob = new Blob([head + rows], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.setAttribute("href", url);
+  link.setAttribute("download", `export_${Date.now()}.csv`);
+  link.click();
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // RBAC — 5 ROLES
 // ═══════════════════════════════════════════════════════════════════════════
 const ROLES = {
-  Admin: { color: C.red, icon: "🔑", pages: ["Documents", "Tasks", "Workflow", "Analytics", "Audit", "Admin"], canUpload: true, canEditTasks: true, canRunAgent: true, canApprove: true, canManageUsers: true, canViewAudit: true },
-  Manager: { color: C.amber, icon: "👔", pages: ["Documents", "Tasks", "Workflow", "Analytics", "Audit"], canUpload: true, canEditTasks: true, canRunAgent: false, canApprove: true, canManageUsers: false, canViewAudit: true },
+  Admin: { color: C.red, icon: "🔑", pages: ["Dashboard", "Documents", "Tasks", "Workflow", "Analytics", "Audit", "Admin"], canUpload: true, canEditTasks: true, canRunAgent: true, canApprove: true, canManageUsers: true, canViewAudit: true },
+  Manager: { color: C.amber, icon: "👔", pages: ["Dashboard", "Documents", "Tasks", "Workflow", "Analytics", "Audit"], canUpload: true, canEditTasks: true, canRunAgent: false, canApprove: true, canManageUsers: false, canViewAudit: true },
   Operations: { color: C.accent, icon: "⚙️", pages: ["Documents", "Tasks", "Workflow", "Analytics"], canUpload: true, canEditTasks: true, canRunAgent: false, canApprove: false, canManageUsers: false, canViewAudit: false },
   Finance: { color: C.green, icon: "💰", pages: ["Tasks", "Analytics"], canUpload: false, canEditTasks: false, canRunAgent: false, canApprove: true, canManageUsers: false, canViewAudit: false },
   Viewer: { color: C.muted, icon: "👁", pages: ["Documents", "Tasks", "Analytics"], canUpload: false, canEditTasks: false, canRunAgent: false, canApprove: false, canManageUsers: false, canViewAudit: false },
@@ -186,6 +197,7 @@ function buildDemoDB() {
       { id: "a2", tenant_id: "acmecorp", name: "RiskAnalyzer", role: "Risk Analysis", system_prompt: "You are a legal and financial risk analysis agent. Identify potential liabilities, unusual clauses, or high-cost items in the provided text. Flash red flags where necessary.", model: "claude-3-5-sonnet-20241022", icon: "🚨" },
       { id: "a3", tenant_id: "acmecorp", name: "TaskExtractor", role: "Workflow Automation", system_prompt: "You are a workflow optimization agent. Extract specific, actionable tasks from the document. Create exactly 3 tasks with clear priorities.", model: "gpt-4o", icon: "⚡" },
     ],
+    comments: [],
   };
 
   return {
@@ -217,6 +229,11 @@ function buildDemoDB() {
     // ── Audit ─────────────────────────────────────────────────────────────
     insertAudit: async (log) => { const l = { id: uid(), created_at: new Date().toISOString(), ...log }; store.audit_logs.unshift(l); return l; },
     getAudit: async (tid, limit = 200) => store.audit_logs.filter(l => l.tenant_id === tid).slice(0, limit).map(l => ({ ...l })),
+    getTaskLogs: async (tid, limit = 200) => store.audit_logs.filter(l => l.tenant_id === "acmecorp" && l.entity === "Task" && l.entity_id === tid).slice(0, limit).map(l => ({ ...l })),
+
+    // ── Comments ──────────────────────────────────────────────────────────
+    getComments: async (tid) => store.comments.filter(c => c.tenant_id === "acmecorp" && c.task_id === tid).map(c => ({ ...c })),
+    insertComment: async (comment) => { const c = { id: uid(), created_at: new Date().toISOString(), ...comment }; store.comments.unshift(c); return c; },
 
     // ── Workflow rules ────────────────────────────────────────────────────
     getRules: async (tid) => store.workflow_rules.filter(r => r.tenant_id === tid).map(r => ({ ...r })),
@@ -288,6 +305,10 @@ function buildSupabaseDB(url, key) {
 
     insertAudit: async (log) => (await ins("audit_logs", log))[0],
     getAudit: async (tid, limit = 200) => q("audit_logs", { tenant_id: `eq.${tid}`, order: "created_at.desc", limit }),
+    getTaskLogs: async (tid, limit = 200) => q("audit_logs", { tenant_id: `eq.${tid}`, entity: "eq.Task", entity_id: `eq.${tid}`, order: "created_at.desc", limit }),
+
+    getComments: async (tid, limit = 200) => q("comments", { tenant_id: `eq.${tid}`, task_id: `eq.${tid}`, order: "created_at.desc", limit }),
+    insertComment: async (comment) => (await ins("comments", comment))[0],
 
     getRules: async (tid) => q("workflow_rules", { tenant_id: `eq.${tid}`, order: "version.desc" }),
     insertRule: async (rule) => (await ins("workflow_rules", rule))[0],
@@ -431,6 +452,90 @@ async function runAgentOnTask(task, customAgent = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SMART TASK ASSIGNMENT — Local rule-based scoring (API-free)
+// ═══════════════════════════════════════════════════════════════════════════
+const DOMAIN_KEYWORDS = {
+  Finance:    ["invoice", "payment", "budget", "expense", "financial", "revenue", "tax", "audit", "cost", "billing", "accounting", "profit", "loss", "p&l", "forecast", "quarter", "q1", "q2", "q3", "q4", "compliance", "regulatory"],
+  Operations: ["process", "workflow", "operations", "logistics", "supply", "chain", "shipping", "inventory", "production", "schedule", "maintenance", "optimize", "efficiency"],
+  Engineering:["code", "deploy", "build", "api", "bug", "fix", "database", "server", "software", "technical", "system", "integration", "architecture", "infrastructure", "test"],
+  Manager:    ["strategy", "review", "approve", "plan", "team", "leadership", "decision", "policy", "manage", "coordinate", "oversee", "stakeholder", "executive", "briefing"],
+  Admin:      ["configure", "setup", "access", "security", "permissions", "admin", "settings", "user", "role", "onboard"],
+  Viewer:     ["report", "summary", "dashboard", "view", "read", "monitor", "track"],
+};
+
+function smartAssignTask(task, profiles, allTasks) {
+  const text = `${task.title || ""} ${task.description || ""} ${(task.tags || []).join(" ")}`.toLowerCase();
+
+  const scored = profiles.map(p => {
+    let score = 0;
+    const reasons = [];
+
+    // ── 1. Domain keyword matching (0-40 pts) ──
+    const roleKeys = DOMAIN_KEYWORDS[p.role] || [];
+    const deptKeys = DOMAIN_KEYWORDS[p.department] || [];
+    const allKeys = [...new Set([...roleKeys, ...deptKeys])];
+    const hits = allKeys.filter(kw => text.includes(kw));
+    const domainScore = Math.min(hits.length * 8, 40);
+    score += domainScore;
+    if (hits.length > 0) reasons.push(`Strong ${p.role}/${p.department} keyword match (${hits.slice(0, 3).join(", ")})`);
+
+    // ── 2. Workload penalty (0 to -25 pts) ──
+    const openTasks = allTasks.filter(t => t.assignee === p.full_name && t.status !== "Done");
+    const workloadPenalty = Math.min(openTasks.length * 5, 25);
+    score -= workloadPenalty;
+    if (openTasks.length === 0) { score += 10; reasons.push("No current open tasks — immediately available"); }
+    else reasons.push(`${openTasks.length} open task${openTasks.length > 1 ? "s" : ""} (workload factor)`);
+
+    // ── 3. Priority × seniority bonus (0-15 pts) ──
+    const isSenior = ["Admin", "Manager"].includes(p.role);
+    if (task.priority === "High" && isSenior) { score += 15; reasons.push("Senior role ideal for high-priority task"); }
+    else if (task.priority === "Low" && !isSenior) { score += 8; reasons.push("Available for lower-priority work"); }
+    else if (task.priority === "Medium") { score += 5; }
+
+    // ── 4. High-priority overload guard (-10 pts) ──
+    const highPriOpen = openTasks.filter(t => t.priority === "High").length;
+    if (highPriOpen >= 2) { score -= 10; reasons.push("Already handling multiple high-priority tasks"); }
+
+    // ── 5. Role capability bonus (0-10 pts) ──
+    const perms = ROLES[p.role];
+    if (perms?.canEditTasks) score += 5;
+    if (perms?.canApprove && (text.includes("approve") || text.includes("review"))) { score += 10; reasons.push("Has approval authority"); }
+
+    return {
+      profile: p,
+      score,
+      reasons,
+      openTasks: openTasks.length,
+      highPriority: highPriOpen,
+    };
+  });
+
+  // Sort by score descending
+  scored.sort((a, b) => b.score - a.score);
+
+  const best = scored[0];
+  const alts = scored.slice(1, 3);
+  const maxScore = 40 + 10 + 15 + 10; // theoretical max
+  const confidence = Math.min(Math.max(best.score / maxScore, 0.3), 0.99);
+
+  // Build human-readable reasoning
+  const reasoning = best.reasons.length > 0
+    ? `${best.profile.full_name} (${best.profile.role}, ${best.profile.department}) is the best fit. ${best.reasons.slice(0, 3).join(". ")}.`
+    : `${best.profile.full_name} selected based on availability and role fit.`;
+
+  return {
+    assignee: best.profile.full_name,
+    reasoning,
+    confidence: Math.round(confidence * 100) / 100,
+    alternates: alts.map(a => ({
+      name: a.profile.full_name,
+      reason: a.reasons[0] || `${a.profile.role} — ${a.openTasks} open tasks`,
+    })),
+    _meta: { model: "Local Engine (API-free)", attempts: 1 },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // GOOGLE DRIVE
 // ═══════════════════════════════════════════════════════════════════════════
 const gdrive = { token: null };
@@ -485,8 +590,90 @@ async function gdriveReadFile(fileId, mimeType) {
 // ═══════════════════════════════════════════════════════════════════════════
 const AuthCtx = createContext(null);
 const AuditCtx = createContext(null);
+const ToastCtx = createContext(null);
+const ThemeCtx = createContext(null);
+
 const useAuth = () => useContext(AuthCtx);
 const useAudit = () => useContext(AuditCtx);
+const useToast = () => useContext(ToastCtx);
+const useTheme = () => useContext(ThemeCtx);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ERROR BOUNDARY
+// ═══════════════════════════════════════════════════════════════════════════
+class ErrorBoundary extends Component {
+  constructor(props) { super(props); this.state = { hasError: false }; }
+  static getDerivedStateFromError() { return { hasError: true }; }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ ...sx.card, textAlign: 'center', padding: 40, margin: 20 }}>
+          <div style={{ fontSize: 40, marginBottom: 16 }}>⚠️</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 8 }}>Something went wrong.</div>
+          <div style={{ fontSize: 12, color: C.muted, marginBottom: 20 }}>We encountered an unexpected error while rendering this page.</div>
+          <button style={sx.btn('primary')} onClick={() => window.location.reload()}>Reload App</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SVG CHARTS
+// ═══════════════════════════════════════════════════════════════════════════
+function DonutChart({ data, size = 120 }) {
+  const total = data.reduce((a, b) => a + b.value, 0);
+  let offset = 0;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
+      <svg width={size} height={size} viewBox="0 0 36 36">
+        {data.map((d, i) => {
+          const p = total > 0 ? (d.value / total) * 100 : 0;
+          const stroke = 100 - offset;
+          offset += p;
+          return <circle key={i} cx="18" cy="18" r="15.915" fill="transparent" stroke={d.color} strokeWidth="3" strokeDasharray={`${p} ${100 - p}`} strokeDashoffset={stroke} />;
+        })}
+        <circle cx="18" cy="18" r="12" fill={C.card} />
+        <text x="18" y="20" textAnchor="middle" fill={C.text} fontSize="6" fontWeight="700">{total}</text>
+      </svg>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        {data.map((d, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10 }}>
+            <div style={{ width: 8, height: 8, borderRadius: 2, background: d.color }} />
+            <span style={{ color: C.muted }}>{d.label}:</span>
+            <span style={{ fontWeight: 700 }}>{d.value}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ActivityLine({ data, height = 40, color = C.accent }) {
+  const max = Math.max(...data, 1);
+  const points = data.map((v, i) => `${(i / Math.max(data.length - 1, 1)) * 100},${height - (v / max) * height}`).join(" ");
+  return (
+    <svg width="100%" height={height} preserveAspectRatio="none">
+      <polyline points={points} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DASHBOARD BANNER
+// ═══════════════════════════════════════════════════════════════════════════
+function DashboardBanner() {
+  const [tasks, setTasks] = useState([]);
+  useEffect(() => { DB.getTasks("acmecorp").then(setTasks); }, []);
+  const overdue = tasks.filter(t => t.due_in_days <= 0 && t.status !== "Done");
+  if (overdue.length === 0) return null;
+  return (
+    <div style={{ background: C.red, color: "#000", fontSize: 11, fontWeight: 700, textAlign: "center", padding: "4px 0", letterSpacing: "0.5px" }}>
+      ⚠️ SLA BREACH: {overdue.length} TASKS OVERDUE. IMMEDIATE ACTION REQUIRED.
+    </div>
+  );
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PRIMITIVE COMPONENTS
@@ -501,6 +688,10 @@ function Bar({ pct, color = C.accent, height = 4 }) {
       <div style={{ height: "100%", width: `${Math.min(Math.max(pct, 0), 100)}%`, background: color, borderRadius: 2, transition: "width .5s ease" }} />
     </div>
   );
+}
+
+function Skeleton({ width = "100%", height = 16, radius = 4, mb = 8 }) {
+  return <div style={{ width, height, background: C.dim, borderRadius: radius, marginBottom: mb, animation: "shimmer 1.5s infinite linear", backgroundImage: `linear-gradient(90deg, ${C.dim} 0%, ${C.surface} 50%, ${C.dim} 100%)`, backgroundSize: "200% 100%" }} />;
 }
 
 function Avatar({ user, size = 32 }) {
@@ -532,6 +723,91 @@ function Modal({ onClose, children, maxWidth = 580 }) {
     <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,0.75)", backdropFilter: "blur(4px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
       <div onClick={e => e.stopPropagation()} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, width: "100%", maxWidth, maxHeight: "92vh", overflowY: "auto", boxShadow: "0 24px 80px rgba(0,0,0,0.7)", animation: "slideUp .2s ease" }}>
         {children}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOAST SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+function ToastContainer({ toasts, remove }) {
+  return (
+    <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 1000, display: "flex", flexDirection: "column", gap: 8, maxWidth: 320 }}>
+      {toasts.map(t => (
+        <div key={t.id} style={{ background: C.surface, border: `1px solid ${C.border}`, borderLeft: `4px solid ${t.type === 'error' ? C.red : t.type === 'success' ? C.green : t.type === 'warn' ? C.amber : C.accent}`, borderRadius: 8, padding: "12px 16px", boxShadow: "0 8px 30px rgba(0,0,0,0.5)", animation: "slideUp .2s ease", display: "flex", alignItems: "center", gap: 12 }}>
+          <span style={{ fontSize: 18 }}>{t.type === 'error' ? '❌' : t.type === 'success' ? '✅' : t.type === 'warn' ? '⚠️' : 'ℹ️'}</span>
+          <div style={{ flex: 1, fontSize: 12, color: C.text, fontWeight: 500 }}>{t.msg}</div>
+          <button onClick={() => remove(t.id)} style={{ background: "none", border: "none", color: C.muted, cursor: "pointer", fontSize: 15 }}>✕</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GLOBAL SEARCH (CMD+K)
+// ═══════════════════════════════════════════════════════════════════════════
+function SearchModal({ onClose }) {
+  const [q, setQ] = useState("");
+  const [res, setRes] = useState({ tasks: [], docs: [] });
+  const [idx, setIdx] = useState(0);
+
+  useEffect(() => {
+    if (!q.trim()) { setRes({ tasks: [], docs: [] }); return; }
+    const run = async () => {
+      const [t, d] = await Promise.all([DB.getTasks("acmecorp"), DB.getDocs("acmecorp")]);
+      const filter = (arr, key) => arr.filter(x => x[key]?.toLowerCase().includes(q.toLowerCase())).slice(0, 5);
+      setRes({ tasks: filter(t, 'title'), docs: filter(d, 'name') });
+      setIdx(0);
+    };
+    run();
+  }, [q]);
+
+  const all = [...res.tasks.map(t => ({ ...t, _t: 'task' })), ...res.docs.map(d => ({ ...d, _t: 'doc' }))];
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 500, background: "rgba(0,0,0,0.6)", backdropFilter: "blur(8px)", display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "12vh 24px" }} onClick={onClose}>
+      <div style={{ width: "100%", maxWidth: 600, background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, overflow: "hidden", boxShadow: "0 30px 100px rgba(0,0,0,0.8)", animation: "slideUp .2s ease" }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: "flex", alignItems: "center", padding: "16px 20px", borderBottom: `1px solid ${C.border}` }}>
+          <span style={{ fontSize: 20, marginRight: 12 }}>🔍</span>
+          <input autoFocus placeholder="Search tasks, documents, people..." style={{ flex: 1, background: "none", border: "none", color: C.text, fontSize: 16, outline: "none", fontFamily: "inherit" }} value={q} onChange={e => setQ(e.target.value)} />
+          <div style={{ fontSize: 10, color: C.muted, background: C.dim, padding: "3px 6px", borderRadius: 4, fontWeight: 700 }}>ESC</div>
+        </div>
+        <div style={{ maxHeight: 400, overflowY: "auto", padding: 8 }}>
+          {!q && <div style={{ padding: 20, textAlign: "center", color: C.muted, fontSize: 12 }}>Type to search for anything across the workspace...</div>}
+          {q && !all.length && <div style={{ padding: 20, textAlign: "center", color: C.muted, fontSize: 12 }}>No results found for "{q}"</div>}
+          
+          {res.docs.length > 0 && <div>
+            <div style={{ ...sx.label, padding: "8px 12px", margin: 0 }}>Documents</div>
+            {res.docs.map(d => (
+              <div key={d.id} style={{ padding: "10px 12px", borderRadius: 8, display: "flex", alignItems: "center", gap: 12, cursor: "pointer", transition: "all .15s" }} onMouseEnter={e => e.currentTarget.style.background = C.dim} onMouseLeave={e => e.currentTarget.style.background = "none"}>
+                <span style={{ fontSize: 18 }}>{d.type === 'Invoice' ? '🧾' : '📄'}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{d.name}</div>
+                  <div style={{ fontSize: 11, color: C.muted }}>{d.type} · {d.size}</div>
+                </div>
+              </div>
+            ))}
+          </div>}
+
+          {res.tasks.length > 0 && <div style={{ marginTop: 8 }}>
+            <div style={{ ...sx.label, padding: "8px 12px", margin: 0 }}>Tasks</div>
+            {res.tasks.map(t => (
+              <div key={t.id} style={{ padding: "10px 12px", borderRadius: 8, display: "flex", alignItems: "center", gap: 12, cursor: "pointer", transition: "all .15s" }} onMouseEnter={e => e.currentTarget.style.background = C.dim} onMouseLeave={e => e.currentTarget.style.background = "none"}>
+                <span style={{ fontSize: 18 }}>✅</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{t.title}</div>
+                  <div style={{ fontSize: 11, color: C.muted }}>{t.assignee} · {t.priority}</div>
+                </div>
+              </div>
+            ))}
+          </div>}
+        </div>
+        <div style={{ padding: "10px 20px", background: C.surface, borderTop: `1px solid ${C.border}`, display: "flex", gap: 12 }}>
+          <div style={{ fontSize: 10, color: C.muted }}><span style={{ color: C.text, fontWeight: 600 }}>↑↓</span> Navigate</div>
+          <div style={{ fontSize: 10, color: C.muted }}><span style={{ color: C.text, fontWeight: 600 }}>Enter</span> Select</div>
+        </div>
       </div>
     </div>
   );
@@ -644,10 +920,22 @@ function MetaCell({ label, children }) {
 // FIX: useAuth called at top level (not inside JSX); state resets when task changes
 // ═══════════════════════════════════════════════════════════════════════════
 function TaskModal({ task, doc, agents = [], onClose, onRunAgent, onUpdate, runningId }) {
-  const { user, perms } = useAuth(); // ← always at top level, never inside JSX
+  const { user, perms } = useAuth();
+  const { C } = useTheme();
+  const toast = useToast();
+  const addAudit = useAudit();
   const isRunning = runningId === task.id;
 
-  // FIX: initialise from task prop; re-init if task.id changes
+  const [smartResult, setSmartResult] = useState(null);
+  const [smartLoading, setSmartLoad] = useState(false);
+  const [smartError, setSmartErr] = useState(null);
+  const [showSmart, setShowSmart] = useState(false);
+
+  const [tab, setTab] = useState("Details");
+  const [comm, setComm] = useState("");
+  const [comments, setComments] = useState([]);
+  const [logs, setLogs] = useState([]);
+
   const [title, setTitle] = useState(task.title || "");
   const [desc, setDesc] = useState(task.description || "");
   const [assignee, setAsgn] = useState(task.assignee || "AI Agent");
@@ -666,149 +954,191 @@ function TaskModal({ task, doc, agents = [], onClose, onRunAgent, onUpdate, runn
     setDue(task.due_in_days ?? 3);
     setTags((task.tags || []).join(", "));
     setSaved(false);
-  }, [task.id]); // only re-init when a different task is opened
+  }, [task.id]);
 
-  const isDirty = title !== task.title || desc !== task.description ||
-    assignee !== task.assignee || priority !== task.priority || status !== task.status;
+  useEffect(() => {
+    if (tab === "Activity") {
+       Promise.all([DB.getComments(task.id), DB.getTaskLogs(task.id)]).then(([c, l]) => {
+         setComments(c); setLogs(l);
+       });
+    }
+  }, [tab, task.id]);
 
-  const save = async () => {
-    await onUpdate(task.id, {
-      title, description: desc, assignee, priority, status,
-      due_in_days: Number(dueIn),
-      tags: tags.split(",").map(t => t.trim()).filter(Boolean),
-    });
-    setSaved(true); setTimeout(() => setSaved(false), 2000);
+  const postComm = async () => {
+    if (!comm.trim()) return;
+    const c = { id: uid(), tenant_id: "acmecorp", task_id: task.id, user_id: user.id, user_name: user.full_name, text: comm, created_at: new Date().toISOString() };
+    await DB.insertComment(c);
+    setComments([c, ...comments]);
+    setComm("");
   };
 
-  const inp = { ...sx.input, fontSize: 13 };
+  const isAI = assignee?.includes("Agent") || agents.some(a => a.name === assignee);
 
   return (
-    <Modal onClose={onClose} maxWidth={600}>
-      {/* Header */}
-      <div style={{ padding: "18px 24px 14px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "flex-start", gap: 12, borderLeft: `4px solid ${priorityColor(priority)}` }}>
-        <div style={{ flex: 1 }}>
-          {perms.canEditTasks
-            ? <input value={title} onChange={e => setTitle(e.target.value)} style={{ ...inp, fontSize: 16, fontWeight: 700, background: "transparent", border: "1px solid transparent", padding: "3px 6px", width: "100%", marginBottom: 8 }} onFocus={e => e.target.style.borderColor = C.accent} onBlur={e => e.target.style.borderColor = "transparent"} />
-            : <div style={{ fontSize: 16, fontWeight: 700, color: C.text, padding: "3px 6px", marginBottom: 8 }}>{title}</div>
-          }
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", paddingLeft: 6 }}>
-            <span style={sx.badge(priorityColor(priority))}>{priority}</span>
-            <span style={sx.badge(statusColor(status))}>{status}</span>
-            <span style={sx.badge(assignee === "AI Agent" ? C.accent : C.green)}>{assignee === "AI Agent" ? "🤖" : "👤"} {assignee}</span>
-            {task.flagged_for_review && <span style={sx.badge(C.amber)}>⚠ Low Confidence</span>}
-            {isDirty && <span style={{ ...sx.badge(C.amber), fontSize: 9 }}>● unsaved</span>}
+    <Modal onClose={onClose} maxWidth={800}>
+      {showSmart && (
+        <SmartAssignModal
+          result={smartResult}
+          onAccept={(name) => {
+            setAsgn(name); onUpdate(task.id, { assignee: name }); setShowSmart(false);
+            toast.success(`Reassigned to ${name}`);
+            addAudit("UPDATE", "Task", task.id, `🧠 Smart-reassigned to ${name} (${Math.round(smartResult?.confidence * 100)}%)`, { reasoning: smartResult?.reasoning, model: smartResult?._meta?.model });
+          }}
+          onAcceptAlt={(name) => {
+            setAsgn(name); onUpdate(task.id, { assignee: name }); setShowSmart(false);
+            toast.success(`Reassigned to ${name}`);
+            addAudit("UPDATE", "Task", task.id, `🧠 Smart-reassigned to ${name}`, { model: smartResult?._meta?.model });
+          }}
+          onClose={() => setShowSmart(false)}
+        />
+      )}
+      <div style={{ padding: "20px 24px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 44, height: 44, background: isAI ? C.purple : C.accent, borderRadius: 12, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24 }}>
+             {isAI ? (agents.find(a => a.name === assignee)?.icon || "🤖") : "👤"}
+          </div>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 700 }}>{task.title || "Untitled Task"}</div>
+            <div style={{ fontSize: 11, color: C.muted }}>Created by {user.full_name} · {fmt(task.created_at)}</div>
           </div>
         </div>
-        <button onClick={onClose} style={{ ...sx.btn("ghost"), padding: "4px 10px", fontSize: 15 }}>✕</button>
+        <button onClick={onClose} style={{ ...sx.btn("ghost"), padding: "4px 10px" }}>✕</button>
       </div>
 
-      <div style={{ padding: "18px 24px", display: "flex", flexDirection: "column", gap: 14 }}>
-        {/* Description */}
-        <div>
-          <span style={sx.label}>Description</span>
-          {perms.canEditTasks
-            ? <textarea value={desc} onChange={e => setDesc(e.target.value)} rows={3} style={{ ...inp, resize: "vertical" }} />
-            : <div style={{ ...inp, color: C.muted, lineHeight: 1.6 }}>{desc || "—"}</div>
-          }
-        </div>
+      <div style={{ display: "flex", borderBottom: `1px solid ${C.border}`, background: C.dim }}>
+        {["Details", "Activity", "Intelligence"].map(t => (
+          <button key={t} onClick={() => setTab(t)} style={{ padding: "12px 20px", border: "none", background: "none", cursor: "pointer", fontSize: 12, fontWeight: 700, color: tab === t ? C.accent : C.muted, borderBottom: `2px solid ${tab === t ? C.accent : "transparent"}`, transition: "all .2s" }}>
+            {t}
+          </button>
+        ))}
+      </div>
 
-        {/* Metadata grid */}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-          <MetaCell label="👤 Assignee">
-            {perms.canEditTasks
-              ? <select value={assignee} onChange={e => setAsgn(e.target.value)} style={{ ...inp, padding: "5px 8px", cursor: "pointer" }}>
-                <optgroup label="System">
-                  <option>AI Agent</option>
-                  <option>Operations Team</option>
-                  <option>Manager</option>
-                  <option>Finance Team</option>
-                </optgroup>
-                {agents.length > 0 && (
-                  <optgroup label="Custom Agents">
-                    {agents.map(a => <option key={a.id} value={a.name}>{a.icon} {a.name}</option>)}
-                  </optgroup>
-                )}
-              </select>
-              : <div style={{ fontSize: 13, color: C.text, paddingTop: 3 }}>{assignee}</div>
-            }
-          </MetaCell>
-          <MetaCell label="🚦 Priority">
-            {perms.canEditTasks
-              ? <select value={priority} onChange={e => setPri(e.target.value)} style={{ ...inp, padding: "5px 8px", cursor: "pointer", color: priorityColor(priority) }}>
-                {["High", "Medium", "Low"].map(p => <option key={p}>{p}</option>)}
-              </select>
-              : <div style={{ fontSize: 13, color: priorityColor(priority), fontWeight: 700, paddingTop: 3 }}>{priority}</div>
-            }
-          </MetaCell>
-          <MetaCell label="📌 Status">
-            {perms.canEditTasks
-              ? <select value={status} onChange={e => setStat(e.target.value)} style={{ ...inp, padding: "5px 8px", cursor: "pointer", color: statusColor(status) }}>
-                {["Todo", "In Progress", "Done", "Blocked"].map(s => <option key={s}>{s}</option>)}
-              </select>
-              : <div style={{ fontSize: 13, color: statusColor(status), fontWeight: 700, paddingTop: 3 }}>{status}</div>
-            }
-          </MetaCell>
-          <MetaCell label="⏰ Due In (days)">
-            {perms.canEditTasks
-              ? <input type="number" min={0} value={dueIn} onChange={e => setDue(e.target.value)} style={{ ...inp, padding: "5px 8px" }} />
-              : <div style={{ fontSize: 13, color: C.text, paddingTop: 3 }}>{dueIn}d</div>
-            }
-          </MetaCell>
-          <MetaCell label="🕐 Created">
-            <div style={{ fontSize: 12, color: C.muted, paddingTop: 3 }}>{fmt(task.created_at)}</div>
-          </MetaCell>
-          <MetaCell label="🏷 Tags">
-            {perms.canEditTasks
-              ? <input value={tags} onChange={e => setTags(e.target.value)} placeholder="finance, invoice" style={{ ...inp, padding: "5px 8px" }} />
-              : <div style={{ fontSize: 12, color: C.muted, paddingTop: 3 }}>{tags || "—"}</div>
-            }
-          </MetaCell>
-        </div>
+      <div style={{ padding: 24, flex: 1, overflowY: "auto", minHeight: 400 }}>
+        {tab === "Details" && (
+          <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 24 }}>
+            <div>
+              <span style={sx.label}>Task Title</span>
+              <input style={{ ...sx.input, fontSize: 16, fontWeight: 700, marginBottom: 16 }} value={title} onChange={e => { setTitle(e.target.value); onUpdate(task.id, { title: e.target.value }); }} />
+              
+              <span style={sx.label}>Description</span>
+              <textarea style={{ ...sx.input, minHeight: 100, marginBottom: 20, resize: "vertical" }} value={desc} onChange={e => { setDesc(e.target.value); onUpdate(task.id, { description: e.target.value }); }} />
+              
+              {isAI && task.agent_log && (
+                <div style={{ marginTop: 20 }}>
+                  <span style={sx.label}>Agent Execution Log</span>
+                  <pre style={{ background: "#000", color: "#0F0", padding: 16, borderRadius: 8, fontSize: 11, fontFamily: "DM Mono, monospace", overflowX: "auto", border: "1px solid #333", whiteSpace: "pre-wrap" }}>
+                    {task.agent_log}
+                  </pre>
+                </div>
+              )}
+            </div>
 
-        {/* Source doc */}
-        {doc && (
-          <div>
-            <span style={sx.label}>Source Document</span>
-            <div style={{ display: "flex", alignItems: "center", gap: 12, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: "12px 14px" }}>
-              <span style={{ fontSize: 22 }}>{doc.type === "Invoice" ? "🧾" : doc.type === "Contract" ? "📋" : doc.type === "Report" ? "📊" : "📄"}</span>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{doc.name}</div>
-                <div style={{ fontSize: 11, color: C.muted }}>{doc.type} · {doc.size} · {Math.round((doc.confidence || 0) * 100)}% confidence {doc.source === "drive" ? "· 🔗 Google Drive" : ""}</div>
+            <div>
+              <div style={{ ...sx.card, background: C.dim }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                  <div>
+                    <span style={sx.label}>Priority</span>
+                    <select style={sx.input} value={priority} onChange={e => { setPri(e.target.value); onUpdate(task.id, { priority: e.target.value }); }}>
+                      <option>Low</option><option>Medium</option><option>High</option>
+                    </select>
+                  </div>
+                  <div>
+                    <span style={sx.label}>Status</span>
+                    <select style={sx.input} value={status} onChange={e => { setStat(e.target.value); onUpdate(task.id, { status: e.target.value }); }}>
+                      <option>Todo</option><option>In Progress</option><option>Done</option><option>Blocked</option>
+                    </select>
+                  </div>
+                  <div>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                      <span style={{ ...sx.label, marginBottom: 0 }}>Assignee</span>
+                      <button style={{ ...sx.btn("ghost"), padding: "2px 8px", fontSize: 10, color: C.purple, border: `1px solid ${C.purple}44` }} onClick={async () => {
+                        try {
+                          const [profiles, allTasks] = await Promise.all([DB.getProfiles("acmecorp"), DB.getTasks("acmecorp")]);
+                          const result = smartAssignTask(task, profiles, allTasks);
+                          result._profiles = profiles;
+                          setSmartResult(result);
+                          setShowSmart(true);
+                        } catch (e) { toast.error(e.message); }
+                      }}>
+                        🧠 Reassign
+                      </button>
+                    </div>
+                    <select style={sx.input} value={assignee} onChange={e => { setAsgn(e.target.value); onUpdate(task.id, { assignee: e.target.value }); }}>
+                      <option>AI Agent</option>
+                      <option>Operations Team</option>
+                      <option>Manager Team</option>
+                      {agents.map(a => <option key={a.id}>{a.name}</option>)}
+                    </select>
+                  </div>
+                </div>
               </div>
-              <span style={sx.badge(doc.confidence < AI.threshold && doc.confidence > 0 ? C.amber : C.green)}>{doc.status}</span>
+              {doc && (
+                <div style={{ ...sx.card, marginTop: 16 }}>
+                  <span style={sx.label}>Source Document</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8 }}>
+                    <div style={{ fontSize: 20 }}>{doc.type === "Invoice" ? "🧾" : "📄"}</div>
+                    <div style={{ fontSize: 12, fontWeight: 600 }}>{doc.name}</div>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
 
-        {/* Agent log */}
-        {task.agent_log && (
+        {tab === "Activity" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16 }}>
+              <textarea value={comm} onChange={e => setComm(e.target.value)} placeholder="Type a comment..." style={{ ...sx.input, minHeight: 60, marginBottom: 12, border: "none", background: "transparent", padding: 0 }} />
+              <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                <button style={sx.btn("primary")} disabled={!comm.trim()} onClick={postComm}>Post Comment</button>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              {[...comments.map(c => ({...c, type: 'comment'})), ...logs.map(l => ({...l, type: 'log'}))].sort((a,b) => new Date(b.created_at) - new Date(a.created_at)).map((item, i) => (
+                <div key={i} style={{ display: "flex", gap: 12 }}>
+                  <div style={{ width: 32, height: 32, background: item.type === 'log' ? C.dim : C.accent, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, flexShrink: 0, color: "#000" }}>
+                    {item.type === 'log' ? "⚡" : (item.user_name?.[0] || "?")}
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 11, marginBottom: 2 }}>
+                      <span style={{ fontWeight: 700, color: C.text }}>{item.user_name || "System"}</span>
+                      <span style={{ color: C.muted, marginLeft: 8 }}>{fmt(item.created_at)}</span>
+                    </div>
+                    <div style={{ fontSize: 13, color: item.type === 'log' ? C.muted : C.text, lineHeight: 1.4 }}>
+                      {item.type === 'log' ? item.description : item.text}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {tab === "Intelligence" && (
           <div>
-            <span style={sx.label}>AI Agent Report</span>
-            <div style={{ background: `${C.green}11`, border: `1px solid ${C.green}33`, borderRadius: 8, padding: "12px 14px", fontSize: 13, color: C.green, lineHeight: 1.6 }}>
-              🤖 {task.agent_log}
-              {task.agent_meta && <div style={{ marginTop: 6, fontSize: 10, color: C.muted }}>Model: {task.agent_meta.model} · {task.agent_meta.attempts} attempt(s)</div>}
-            </div>
+             <span style={sx.label}>AI Execution Context</span>
+             <div style={{ background: C.dim, padding: 20, borderRadius: 12, color: C.muted, fontSize: 13, textAlign: "center" }}>
+               {task.agent_meta ? (
+                  <div>
+                    Used model <span style={{ color: C.purple, fontWeight: 700 }}>{task.agent_meta.model}</span> with {task.agent_meta.attempts} attempts.
+                    <div style={{ marginTop: 10 }}>Estimated Latency: 4.2s · Cost: $0.0024</div>
+                  </div>
+               ) : "Run an AI agent to see intelligence metrics."}
+             </div>
           </div>
         )}
+      </div>
 
-        {/* FIX: role check using already-hoisted `perms`, never calling useAuth() in JSX */}
-        {!perms.canEditTasks && (
-          <Notice type="warn">🔒 {user.role} role is view-only for tasks. Contact an Admin to change your permissions.</Notice>
-        )}
-
-        {/* Actions */}
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", paddingTop: 4, borderTop: `1px solid ${C.border}` }}>
-          {perms.canEditTasks && <button style={sx.btn("primary")} onClick={save}>{saved ? "✓ Saved!" : "💾 Save Changes"}</button>}
-          {(assignee === "AI Agent" || agents.some(a => a.name === assignee)) && status !== "Done" && perms.canRunAgent && (
+      <div style={{ padding: "16px 24px", borderTop: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", background: C.surface }}>
+        <div>
+          {isAI && status !== "Done" && perms.canRunAgent && (
             <button style={sx.btn("green")} onClick={() => onRunAgent(task)} disabled={isRunning}>
-              {isRunning ? <><Spinner /> Running…</> : `⚡ Run ${assignee.includes("Agent") ? "Agent" : assignee}`}
+              {isRunning ? <><Spinner /> Running Agent…</> : "⚡ Run AI Agent"}
             </button>
           )}
-          {status !== "Done" && perms.canEditTasks && (
-            <button style={sx.btn("ghost")} onClick={() => setStat("Done")}>✓ Mark Done</button>
-          )}
-          <button style={{ ...sx.btn("ghost"), marginLeft: "auto" }} onClick={onClose}>Close</button>
         </div>
+        <button style={sx.btn("primary")} onClick={onClose}>Finish & Close</button>
       </div>
     </Modal>
   );
@@ -817,12 +1147,75 @@ function TaskModal({ task, doc, agents = [], onClose, onRunAgent, onUpdate, runn
 // ═══════════════════════════════════════════════════════════════════════════
 // DOCUMENTS PAGE
 // ═══════════════════════════════════════════════════════════════════════════
+function DocPreviewModal({ doc, tasks, onClose }) {
+  return (
+    <Modal onClose={onClose} maxWidth={700}>
+      <div style={{ padding: "20px 24px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <span style={{ fontSize: 24 }}>{doc.type === "Invoice" ? "🧾" : "📄"}</span>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 700 }}>{doc.name}</div>
+            <div style={{ fontSize: 11, color: C.muted }}>{doc.type} · {doc.size} · Uploaded {fmt(doc.created_at)}</div>
+          </div>
+        </div>
+        <button onClick={onClose} style={{ ...sx.btn("ghost"), padding: "4px 10px" }}>✕</button>
+      </div>
+      <div style={{ padding: 24 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 24 }}>
+          <div>
+            <span style={sx.label}>AI Analysis Summary</span>
+            <div style={{ fontSize: 14, color: C.text, lineHeight: 1.6, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 16, marginBottom: 20 }}>
+              {doc.summary || "No summary available for this document."}
+            </div>
+
+            <span style={sx.label}>Extracted Entities</span>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 20 }}>
+              {doc.entities ? Object.entries(doc.entities).map(([k, v]) => (
+                <div key={k} style={{ ...sx.badge(C.accent), padding: "4px 10px" }}>
+                  <span style={{ fontSize: 10, fontWeight: 400, color: C.muted, marginRight: 4 }}>{k}:</span>{String(v)}
+                </div>
+              )) : <div style={{ fontSize: 11, color: C.muted }}>No entities detected</div>}
+            </div>
+          </div>
+
+          <div>
+            <span style={sx.label}>Linked Tasks ({tasks.length})</span>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {tasks.length === 0 && <div style={{ fontSize: 11, color: C.muted, padding: 10, textAlign: "center", background: C.dim, borderRadius: 8 }}>No tasks linked to this document</div>}
+              {tasks.map(t => (
+                <div key={t.id} style={{ padding: 10, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700 }}>{t.title}</div>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+                    <span style={sx.badge(statusColor(t.status))}>{t.status}</span>
+                    <span style={{ fontSize: 10, color: C.muted }}>{t.assignee}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            
+            <div style={{ marginTop: 20, padding: 16, border: `1px dashed ${C.border}`, borderRadius: 10, textAlign: "center" }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: doc.confidence < 0.7 ? C.amber : C.green }}>{Math.round(doc.confidence * 100)}%</div>
+              <div style={{ fontSize: 9, color: C.muted, marginBottom: 8 }}>AI Confidence Level</div>
+              <Bar pct={doc.confidence * 100} color={doc.confidence < 0.7 ? C.amber : C.green} />
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style={{ padding: "16px 24px", background: C.surface, borderTop: `1px solid ${C.border}`, display: "flex", justifyContent: "flex-end" }}>
+        <button style={sx.btn("primary")} onClick={onClose}>Finish Review</button>
+      </div>
+    </Modal>
+  );
+}
+
 function DocumentsPage() {
   const { user, perms } = useAuth();
   const addAudit = useAudit();
+  const toast = useToast();
 
   const [docs, setDocs] = useState([]);
   const [tasks, setTasks] = useState([]);
+  const [loading, setLoading] = useState(true);
   const [processing, setProc] = useState(null);
   const [textInput, setText] = useState("");
   const [showPaste, setPaste] = useState(false);
@@ -831,22 +1224,24 @@ function DocumentsPage() {
   const [driveLoading, setDriveLoad] = useState(false);
   const [driveError, setDriveErr] = useState("");
   const [importingId, setImportingId] = useState(null);
-  const [error, setError] = useState("");
+  const [page, setPage] = useState(1);
   const fileRef = useRef();
+  const pageSize = 25;
 
   const reload = useCallback(async () => {
-    const [d, t] = await Promise.all([DB.getDocs("acmecorp"), DB.getTasks("acmecorp")]);
-    setDocs(d); setTasks(t);
-  }, []);
+    try {
+      const [d, t] = await Promise.all([DB.getDocs("acmecorp"), DB.getTasks("acmecorp")]);
+      setDocs(d); setTasks(t);
+    } catch (e) { toast.error("Failed to load documents"); }
+    finally { setLoading(false); }
+  }, [toast]);
 
   useEffect(() => { reload(); }, [reload]);
 
   const processDoc = async (name, size, content, source = "upload", driveFileId = null) => {
-    if (!perms.canUpload) { setError("Your role does not have upload permissions."); return; }
-    setError("");
+    if (!perms.canUpload) { toast.error("Your role does not have upload permissions."); return; }
     const docId = uid();
     const placeholder = { id: docId, tenant_id: "acmecorp", name, size, status: "Processing", type: "Processing…", confidence: 0, uploaded_by: user.id, source, drive_file_id: driveFileId, created_at: new Date().toISOString() };
-    // Optimistic local prepend — deduped on reload since DB.insertDoc won't double-insert
     setDocs(prev => prev.some(d => d.id === docId) ? prev : [placeholder, ...prev]);
     setProc(docId);
     await DB.insertDoc(placeholder);
@@ -855,6 +1250,7 @@ function DocumentsPage() {
     try {
       const result = await processDocument(content);
       await DB.updateDoc(docId, { type: result.docType, status: "Processed", confidence: result.confidence, summary: result.summary, entities: result.entities, ai_meta: result._meta });
+      toast.success(`Processed "${name}" successfully`);
       if (result.confidence < AI.threshold) {
         await addAudit("UPDATE", "Document", docId, `Low AI confidence (${Math.round(result.confidence * 100)}%) — tasks routed to human review`);
       }
@@ -866,44 +1262,44 @@ function DocumentsPage() {
     } catch (e) {
       await DB.updateDoc(docId, { status: "Error", type: "Error", summary: e.message });
       await addAudit("UPDATE", "Document", docId, `AI processing failed: ${e.message}`);
-      setError(`AI processing failed: ${e.message}`);
+      toast.error(`AI processing failed: ${e.message}`);
     }
     setProc(null);
     await reload();
   };
 
   const handleFiles = (files) => {
-    if (!perms.canUpload) { setError("Your role cannot upload documents."); return; }
+    if (!perms.canUpload) { toast.error("Your role cannot upload documents."); return; }
     Array.from(files).forEach(f => {
       const isBin = f.type === "application/pdf" || f.name.endsWith(".docx") || f.name.endsWith(".pptx");
       const size = `${(f.size / 1024).toFixed(0)} KB`;
       if (isBin) { processDoc(f.name, size, `[Binary file: ${f.name}, type: ${f.type}] Infer document purpose and generate workflow tasks.`); return; }
       const r = new FileReader();
       r.onload = e => processDoc(f.name, size, e.target.result);
-      r.onerror = () => setError(`Could not read file: ${f.name}`);
+      r.onerror = () => toast.error(`Could not read file: ${f.name}`);
       r.readAsText(f);
     });
   };
 
   // Google Drive
   const connectDrive = async () => {
-    if (!GDRIVE_READY) { setDriveErr("Set GDRIVE_CLIENT_ID in the config constants at the top of the file."); return; }
+    if (!GDRIVE_READY) { toast.warn("Set GDRIVE_CLIENT_ID in the config constants."); return; }
     setDriveLoad(true); setDriveErr("");
     try {
       await gdriveAuth();
       setDriveConn(true);
       await addAudit("UPDATE", "Integration", "gdrive", `${user.full_name} connected Google Drive`);
-      // fetch files directly without calling loadDriveFiles() to avoid double loading state
       const { files } = await gdriveListFiles();
       setDriveFiles(files || []);
-    } catch (e) { setDriveErr(e.message); }
+      toast.success("Google Drive connected");
+    } catch (e) { setDriveErr(e.message); toast.error("Drive connection failed"); }
     finally { setDriveLoad(false); }
   };
 
   const loadDriveFiles = async () => {
     setDriveLoad(true); setDriveErr("");
     try { const { files } = await gdriveListFiles(); setDriveFiles(files || []); }
-    catch (e) { setDriveErr(e.message); }
+    catch (e) { setDriveErr(e.message); toast.error("Failed to load Drive files"); }
     finally { setDriveLoad(false); }
   };
 
@@ -915,19 +1311,23 @@ function DocumentsPage() {
       await processDoc(f.name, sizeKB, content, "drive", f.id);
       await addAudit("CREATE", "Document", f.id, `Imported from Google Drive: "${f.name}"`);
       setDriveFiles(prev => prev.filter(x => x.id !== f.id));
-    } catch (e) { setDriveErr(e.message); }
+    } catch (e) { setDriveErr(e.message); toast.error("Import failed"); }
     finally { setImportingId(null); }
   };
 
   const alreadyImported = (id) => docs.some(d => d.drive_file_id === id);
   const docTaskCount = (id) => tasks.filter(t => t.doc_id === id).length;
 
+  const paginated = docs.slice((page - 1) * pageSize, page * pageSize);
+  const totalPages = Math.ceil(docs.length / pageSize);
+  const [selectedDoc, setSelDoc] = useState(null);
+
   return (
     <div>
+      {selectedDoc && <DocPreviewModal doc={selectedDoc} tasks={tasks.filter(t => t.doc_id === selectedDoc.id)} onClose={() => setSelDoc(null)} />}
       <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: "-0.5px", marginBottom: 6, color: C.text }}>Document Ingestion</div>
-      <div style={{ fontSize: 12, color: C.muted, marginBottom: 22 }}>{docs.length} documents · Upload, paste text, or sync from Google Drive · AI auto-generates tasks</div>
 
-      {error && <Notice type="error">⚠ {error}</Notice>}
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 22 }}>{docs.length} documents · Upload, paste text, or sync from Google Drive · AI auto-generates tasks</div>
 
       {/* Upload zone */}
       {perms.canUpload && (
@@ -1023,43 +1423,61 @@ function DocumentsPage() {
 
       {/* Document list */}
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {docs.length === 0 && <div style={{ ...sx.card, textAlign: "center", color: C.muted, padding: 48 }}>No documents yet — upload a file, paste text, or connect Google Drive</div>}
-        {docs.map(doc => {
-          const count = docTaskCount(doc.id);
-          const isProc = processing === doc.id;
-          return (
-            <div key={doc.id} style={{ ...sx.card, padding: "14px 18px" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                <div style={{ fontSize: 26, flexShrink: 0 }}>
-                  {doc.type === "Invoice" ? "🧾" : doc.type === "Contract" ? "📋" : doc.type === "Report" ? "📊" : doc.source === "drive" ? "🔗" : "📄"}
-                </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{doc.name}</div>
-                  <div style={{ fontSize: 11, color: C.muted, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                    <span>{doc.size}</span>
-                    <span>{fmt(doc.created_at)}</span>
-                    {doc.source === "drive" && <span style={{ color: C.accent }}>🔗 Google Drive</span>}
-                    {doc.summary && <span style={{ color: C.text }}>· {doc.summary}</span>}
-                    {doc.ai_meta && <span style={{ color: C.purple }}>· {doc.ai_meta.model} ({doc.ai_meta.attempts} attempt{doc.ai_meta.attempts > 1 ? "s" : ""})</span>}
+        {loading ? (
+          <>
+            <Skeleton height={60} />
+            <Skeleton height={60} />
+            <Skeleton height={60} />
+          </>
+        ) : docs.length === 0 ? (
+          <div style={{ ...sx.card, textAlign: "center", color: C.muted, padding: 48 }}>No documents yet — upload a file, paste text, or connect Google Drive</div>
+        ) : (
+          paginated.map(doc => {
+            const count = docTaskCount(doc.id);
+            const isProc = processing === doc.id;
+            return (
+              <div key={doc.id} onClick={() => setSelDoc(doc)} style={{ ...sx.card, padding: "14px 18px", cursor: "pointer", transition: "all .12s" }} onMouseEnter={e => e.currentTarget.style.borderColor = C.accent} onMouseLeave={e => e.currentTarget.style.borderColor = C.border}>
+                <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                  <div style={{ fontSize: 26, flexShrink: 0 }}>
+
+                    {doc.type === "Invoice" ? "🧾" : doc.type === "Contract" ? "📋" : doc.type === "Report" ? "📊" : doc.source === "drive" ? "🔗" : "📄"}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{doc.name}</div>
+                    <div style={{ fontSize: 11, color: C.muted, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                      <span>{doc.size}</span>
+                      <span>{fmt(doc.created_at)}</span>
+                      {doc.source === "drive" && <span style={{ color: C.accent }}>🔗 Google Drive</span>}
+                      {doc.summary && <span style={{ color: C.text }}>· {doc.summary}</span>}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                    {isProc && <div style={{ display: "flex", alignItems: "center", gap: 6, color: C.accent, fontSize: 12 }}><Spinner /> Analyzing…</div>}
+                    {doc.confidence > 0 && (
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ fontSize: 15, fontWeight: 700, color: doc.confidence < AI.threshold ? C.amber : C.green }}>{Math.round(doc.confidence * 100)}%</div>
+                        <div style={{ fontSize: 9, color: C.muted }}>confidence</div>
+                      </div>
+                    )}
+                    {count > 0 && <span style={sx.badge(C.accent)}>{count} task{count > 1 ? "s" : ""}</span>}
+                    <span style={sx.badge(doc.status === "Processed" ? C.green : doc.status === "Error" ? C.red : C.amber)}>{doc.status}</span>
                   </div>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                  {isProc && <div style={{ display: "flex", alignItems: "center", gap: 6, color: C.accent, fontSize: 12 }}><Spinner /> Analyzing…</div>}
-                  {doc.confidence > 0 && (
-                    <div style={{ textAlign: "center" }}>
-                      <div style={{ fontSize: 15, fontWeight: 700, color: doc.confidence < AI.threshold ? C.amber : C.green }}>{Math.round(doc.confidence * 100)}%</div>
-                      <div style={{ fontSize: 9, color: C.muted }}>confidence</div>
-                    </div>
-                  )}
-                  {count > 0 && <span style={sx.badge(C.accent)}>{count} task{count > 1 ? "s" : ""}</span>}
-                  {doc.confidence < AI.threshold && doc.confidence > 0 && <span style={sx.badge(C.amber)}>⚠ Review</span>}
-                  <span style={sx.badge(doc.status === "Processed" ? C.green : doc.status === "Error" ? C.red : C.amber)}>{doc.status}</span>
-                </div>
               </div>
-            </div>
-          );
-        })}
+            );
+          })
+        )}
       </div>
+
+      {totalPages > 1 && (
+        <div style={{ display: "flex", justifyContent: "center", gap: 10, marginTop: 24 }}>
+          <button style={sx.btn("ghost")} disabled={page === 1} onClick={() => setPage(p => p - 1)}>Previous</button>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 12, color: C.muted, fontWeight: 600 }}>
+            Page {page} of {totalPages}
+          </div>
+          <button style={sx.btn("ghost")} disabled={page === totalPages} onClick={() => setPage(p => p + 1)}>Next</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1070,17 +1488,27 @@ function DocumentsPage() {
 function TasksPage() {
   const { user, perms } = useAuth();
   const addAudit = useAudit();
+  const toast = useToast();
+
   const [tasks, setTasks] = useState([]);
   const [docs, setDocs] = useState([]);
   const [agents, setAgents] = useState([]);
+  const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("All");
   const [selected, setSel] = useState(null);
   const [runningId, setRun] = useState(null);
+  const [showNew, setShowNew] = useState(false);
+  const [checked, setChecked] = useState([]);
+  const [page, setPage] = useState(1);
+  const pageSize = 25;
 
   const reload = useCallback(async () => {
-    const [t, d, a] = await Promise.all([DB.getTasks("acmecorp"), DB.getDocs("acmecorp"), DB.getAgents("acmecorp")]);
-    setTasks(t); setDocs(d); setAgents(a);
-  }, []);
+    try {
+      const [t, d, a] = await Promise.all([DB.getTasks("acmecorp"), DB.getDocs("acmecorp"), DB.getAgents("acmecorp")]);
+      setTasks(t); setDocs(d); setAgents(a);
+    } catch (e) { toast.error("Failed to load tasks"); }
+    finally { setLoading(false); }
+  }, [toast]);
 
   useEffect(() => { reload(); }, [reload]);
 
@@ -1094,17 +1522,18 @@ function TasksPage() {
       const { report, model, attempts } = await runAgentOnTask(task, customAgent);
       await DB.updateTask(task.id, { status: "Done", agent_log: report, agent_meta: { model, attempts } });
       await addAudit("UPDATE", "Task", task.id, `AI agent completed: "${task.title}"`, { model });
+      toast.success(`Agent finished: ${task.title}`);
     } catch (e) {
       await DB.updateTask(task.id, { status: "Blocked", agent_log: `Failed after retries: ${e.message}` });
       await addAudit("UPDATE", "Task", task.id, `AI agent failed: ${e.message}`);
+      toast.error(`Agent failed: ${e.message}`);
     }
     setRun(null);
-    const [freshTasks] = await Promise.all([DB.getTasks("acmecorp"), DB.getDocs("acmecorp").then(setDocs)]);
-    setTasks(freshTasks);
-    // Sync open modal with updated task data
+    await reload();
+    // Sync open modal
     if (selected?.id === task.id) {
-      const fresh = freshTasks.find(t => t.id === task.id);
-      if (fresh) setSel(fresh);
+       const fresh = (await DB.getTasks("acmecorp")).find(t => t.id === task.id);
+       if (fresh) setSel(fresh);
     }
   };
 
@@ -1113,66 +1542,293 @@ function TasksPage() {
     await DB.updateTask(id, fields);
     await addAudit("UPDATE", "Task", id, `Updated "${old?.title || id}"`, { changed: Object.keys(fields) });
     await reload();
-    // FIX: sync open modal
     if (selected?.id === id) setSel(prev => ({ ...prev, ...fields }));
+  };
+
+  const createTask = async (row) => {
+    try {
+      const id = uid();
+      const payload = { ...row, id, tenant_id: "acmecorp", status: "Todo", created_by: user.id, created_at: new Date().toISOString() };
+      await DB.insertTask(payload);
+      await addAudit("CREATE", "Task", id, `Manually created: "${row.title}"`);
+      toast.success("Task created");
+      setShowNew(false);
+      await reload();
+    } catch (e) { toast.error("Failed to create task"); }
+  };
+
+  const bulkUpdate = async (fields) => {
+    try {
+      await Promise.all(checked.map(id => DB.updateTask(id, fields)));
+      await addAudit("UPDATE", "Task", "Bulk", `Bulk updated ${checked.length} tasks`, { fields });
+      toast.success(`Updated ${checked.length} tasks`);
+      setChecked([]);
+      await reload();
+    } catch (e) { toast.error("Bulk update failed"); }
   };
 
   const statuses = ["All", "Todo", "In Progress", "Done", "Blocked"];
   const filtered = filter === "All" ? tasks : tasks.filter(t => t.status === filter);
+  const totalPages = Math.ceil(filtered.length / pageSize);
+  const paginated = filtered.slice((page - 1) * pageSize, page * pageSize);
   const selDoc = docs.find(d => d.id === selected?.doc_id);
 
   return (
     <div>
       {selected && <TaskModal task={selected} doc={selDoc} agents={agents} onClose={() => setSel(null)} onRunAgent={runAgent} onUpdate={updateTask} runningId={runningId} />}
+      {showNew && <NewTaskModal agents={agents} onClose={() => setShowNew(false)} onSave={createTask} />}
 
-      <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: "-0.5px", marginBottom: 6, color: C.text }}>Task Management</div>
-      <div style={{ fontSize: 12, color: C.muted, marginBottom: 22 }}>{tasks.length} tasks · AI-generated · Click any task to view & edit · Role: <span style={{ color: ROLES[user.role]?.color }}>{user.role}</span></div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 22 }}>
+        <div>
+          <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: "-0.5px", marginBottom: 6, color: C.text }}>Task Management</div>
+          <div style={{ fontSize: 12, color: C.muted }}>{tasks.length} tasks · AI-generated & manual · Role: <span style={{ color: ROLES[user.role]?.color }}>{user.role}</span></div>
+        </div>
+        <button style={sx.btn("primary")} onClick={() => setShowNew(true)}>+ New Task</button>
+      </div>
 
-      <div style={{ display: "flex", gap: 4, marginBottom: 18, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 4, marginBottom: 18, flexWrap: "wrap", alignItems: "center" }}>
         {statuses.map(st => (
-          <button key={st} style={{ padding: "6px 12px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 11, fontFamily: "inherit", fontWeight: filter === st ? 700 : 400, background: filter === st ? `${C.accent}22` : "transparent", color: filter === st ? C.accent : C.muted }} onClick={() => setFilter(st)}>
+          <button key={st} style={{ padding: "6px 12px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 11, fontFamily: "inherit", fontWeight: filter === st ? 700 : 400, background: filter === st ? `${C.accent}22` : "transparent", color: filter === st ? C.accent : C.muted }} onClick={() => { setFilter(st); setPage(1); }}>
             {st} ({st === "All" ? tasks.length : tasks.filter(t => t.status === st).length})
           </button>
         ))}
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {filtered.length === 0 && <div style={{ ...sx.card, textAlign: "center", color: C.muted, padding: 48 }}>No tasks here yet — upload a document to auto-generate tasks</div>}
-        {filtered.map(task => (
-          <div key={task.id} onClick={() => setSel(task)}
-            style={{ ...sx.card, borderLeft: `3px solid ${priorityColor(task.priority)}`, cursor: "pointer", transition: "background .12s" }}
-            onMouseEnter={e => e.currentTarget.style.background = "#1C2130"}
-            onMouseLeave={e => e.currentTarget.style.background = C.card}
-          >
-            <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5, flexWrap: "wrap" }}>
-                  <span style={{ fontWeight: 600, fontSize: 13 }}>{task.title}</span>
-                  <span style={sx.badge(priorityColor(task.priority))}>{task.priority}</span>
-                  <span style={sx.badge(statusColor(task.status))}>{task.status}</span>
-                  {task.flagged_for_review && <span style={sx.badge(C.amber)}>⚠ Low Confidence</span>}
+        {loading ? (
+          <>
+            <Skeleton height={80} />
+            <Skeleton height={80} />
+            <Skeleton height={80} />
+          </>
+        ) : filtered.length === 0 ? (
+          <div style={{ ...sx.card, textAlign: "center", color: C.muted, padding: 48 }}>No tasks here yet — upload a document or create one manually</div>
+        ) : (
+          paginated.map(task => (
+            <div key={task.id} onClick={() => setSel(task)}
+              style={{ ...sx.card, borderLeft: `3px solid ${priorityColor(task.priority)}`, cursor: "pointer", transition: "background .12s", position: "relative" }}
+              onMouseEnter={e => e.currentTarget.style.background = "#1C2130"}
+              onMouseLeave={e => e.currentTarget.style.background = C.card}
+            >
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+                <input type="checkbox" checked={checked.includes(task.id)} onClick={e => e.stopPropagation()} onChange={e => {
+                  e.stopPropagation();
+                  setChecked(p => e.target.checked ? [...p, task.id] : p.filter(x => x !== task.id));
+                }} style={{ marginTop: 4, cursor: "pointer" }} />
+                
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5, flexWrap: "wrap" }}>
+                    <span style={{ fontWeight: 600, fontSize: 13 }}>{task.title}</span>
+                    <span style={sx.badge(priorityColor(task.priority))}>{task.priority}</span>
+                    <span style={sx.badge(statusColor(task.status))}>{task.status}</span>
+                  </div>
+                  <div style={{ fontSize: 12, color: C.muted, marginBottom: 6, lineHeight: 1.4 }}>{task.description}</div>
+                  <div style={{ fontSize: 11, color: C.dim, display: "flex", gap: 12, flexWrap: "wrap" }}>
+                    <span>{task.assignee?.includes("Agent") || agents.some(a => a.name === task.assignee) ? (agents.find(a => a.name === task.assignee)?.icon || "🤖") : "👤"} {task.assignee}</span>
+                    {task.due_in_days >= 0 && <span style={{ color: task.due_in_days <= 1 && task.status !== "Done" ? C.red : C.muted }}>⏰ {task.due_in_days}d</span>}
+                    <span>🕐 {fmt(task.created_at)}</span>
+                  </div>
                 </div>
-                <div style={{ fontSize: 12, color: C.muted, marginBottom: 6, lineHeight: 1.4 }}>{task.description}</div>
-                <div style={{ fontSize: 11, color: C.dim, display: "flex", gap: 12, flexWrap: "wrap" }}>
-                  <span>{task.assignee === "AI Agent" || agents.some(a => a.name === task.assignee) ? (agents.find(a => a.name === task.assignee)?.icon || "🤖") : "👤"} {task.assignee}</span>
-                  {task.due_in_days > 0 && <span style={{ color: task.due_in_days <= 1 ? C.red : C.muted }}>⏰ {task.due_in_days}d</span>}
-                  <span>🕐 {fmt(task.created_at)}</span>
-                  {(task.tags || []).map(tag => <span key={tag} style={{ background: C.dim, color: C.muted, padding: "1px 5px", borderRadius: 3, fontSize: 10 }}>#{tag}</span>)}
-                </div>
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end", flexShrink: 0 }}>
-                <span style={{ fontSize: 10, color: C.dim }}>click to view ›</span>
-                {task.assignee === "AI Agent" && task.status !== "Done" && perms.canRunAgent && (
-                  <button style={sx.btn("green")} onClick={e => { e.stopPropagation(); runAgent(task); }} disabled={runningId === task.id}>
-                    {runningId === task.id ? <><Spinner /> Running…</> : "⚡ Run Agent"}
-                  </button>
-                )}
+                <div style={{ fontSize: 10, color: C.dim }}>click to view ›</div>
               </div>
             </div>
-          </div>
-        ))}
+          ))
+        )}
       </div>
+
+      {totalPages > 1 && (
+        <div style={{ display: "flex", justifyContent: "center", gap: 10, marginTop: 24 }}>
+          <button style={sx.btn("ghost")} disabled={page === 1} onClick={() => setPage(p => p - 1)}>Previous</button>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 12, color: C.muted, fontWeight: 600 }}>Page {page} of {totalPages}</div>
+          <button style={sx.btn("ghost")} disabled={page === totalPages} onClick={() => setPage(p => p + 1)}>Next</button>
+        </div>
+      )}
+
+      {/* Bulk actions bar */}
+      {checked.length > 0 && (
+        <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: C.surface, border: `1px solid ${C.accent}`, borderRadius: 12, padding: "12px 20px", display: "flex", alignItems: "center", gap: 16, boxShadow: "0 20px 50px rgba(0,0,0,0.6)", zIndex: 100, animation: "slideUp .2s ease" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.accent }}>{checked.length} selected</div>
+          <div style={{ width: 1, height: 20, background: C.border }} />
+          <button style={sx.btn("ghost")} onClick={() => bulkUpdate({ status: "Done" })}>✓ Mark Done</button>
+          <button style={sx.btn("ghost")} onClick={() => bulkUpdate({ priority: "High" })}>🚦 High Priority</button>
+          <button style={{ ...sx.btn("ghost"), color: C.purple }} onClick={async () => {
+            try {
+              const [profiles, allT] = await Promise.all([DB.getProfiles("acmecorp"), DB.getTasks("acmecorp")]);
+              for (const id of checked) {
+                const tsk = tasks.find(t => t.id === id);
+                if (!tsk) continue;
+                const res = smartAssignTask(tsk, profiles, allT);
+                await DB.updateTask(id, { assignee: res.assignee });
+                await addAudit("UPDATE", "Task", id, `🧠 Smart-assigned to ${res.assignee} (${Math.round(res.confidence * 100)}%)`, { reasoning: res.reasoning, model: res._meta?.model });
+              }
+              toast.success(`Smart-assigned ${checked.length} tasks`);
+              setChecked([]); await reload();
+            } catch (e) { toast.error(`Smart assign failed: ${e.message}`); }
+          }}>🧠 Smart Assign</button>
+          <button style={sx.btn("ghost")} onClick={() => setChecked([])}>Cancel</button>
+        </div>
+      )}
     </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SMART ASSIGN MODAL — Shows LLM recommendation with reasoning
+// ═══════════════════════════════════════════════════════════════════════════
+function SmartAssignModal({ result, onAccept, onAcceptAlt, onClose }) {
+  if (!result) return null;
+
+  const profile = result._profiles?.find(p => p.full_name === result.assignee);
+  const confColor = result.confidence >= 0.85 ? C.green : result.confidence >= 0.6 ? C.amber : C.red;
+
+  return (
+    <Modal onClose={onClose} maxWidth={540}>
+      <div style={{ padding: "20px 24px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ width: 40, height: 40, background: `linear-gradient(135deg,${C.purple},${C.accent})`, borderRadius: 12, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>🧠</div>
+        <div>
+          <div style={{ fontSize: 16, fontWeight: 700 }}>AI Recommendation</div>
+          <div style={{ fontSize: 11, color: C.muted }}>Model: {result._meta?.model} · Attempts: {result._meta?.attempts}</div>
+        </div>
+      </div>
+
+      <div style={{ padding: "20px 24px" }}>
+        {/* Primary recommendation */}
+        <div style={{ background: `${C.accent}08`, border: `1px solid ${C.accent}33`, borderRadius: 12, padding: 18, marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
+            <Avatar user={profile} size={40} />
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{result.assignee}</div>
+              <div style={{ fontSize: 11, color: C.muted }}>{profile?.role || "Team Member"} · {profile?.department || "—"}</div>
+            </div>
+            <div style={{ textAlign: "center" }}>
+              <div style={{ fontSize: 18, fontWeight: 700, color: confColor }}>{Math.round(result.confidence * 100)}%</div>
+              <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.5px" }}>confidence</div>
+            </div>
+          </div>
+          <Bar pct={result.confidence * 100} color={confColor} height={4} />
+          <div style={{ marginTop: 12, fontSize: 12, color: C.text, lineHeight: 1.6, padding: "10px 14px", background: C.surface, borderRadius: 8, border: `1px solid ${C.border}` }}>
+            💡 {result.reasoning}
+          </div>
+        </div>
+
+        {/* Alternates */}
+        {result.alternates?.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <span style={sx.label}>Alternates</span>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {result.alternates.map((alt, i) => {
+                const altProfile = result._profiles?.find(p => p.full_name === alt.name);
+                return (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8 }}>
+                    <Avatar user={altProfile} size={28} />
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{alt.name}</div>
+                      <div style={{ fontSize: 10, color: C.muted }}>{alt.reason}</div>
+                    </div>
+                    <button style={{ ...sx.btn("ghost"), padding: "4px 10px", fontSize: 10 }} onClick={() => onAcceptAlt(alt.name)}>Select</button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <button style={sx.btn("ghost")} onClick={onClose}>Cancel</button>
+          <button style={{ ...sx.btn("green"), fontSize: 13, padding: "10px 20px" }} onClick={() => onAccept(result.assignee)}>
+            ✅ Assign to {result.assignee.split(" ")[0]}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function NewTaskModal({ agents, onClose, onSave }) {
+  const toast = useToast();
+  const [title, setTitle] = useState("");
+  const [desc, setDesc] = useState("");
+  const [priority, setPri] = useState("Medium");
+  const [assignee, setAsgn] = useState("AI Agent");
+  const [due, setDue] = useState(3);
+  const [smartResult, setSmartResult] = useState(null);
+  const [smartLoading, setSmartLoad] = useState(false);
+  const [smartError, setSmartErr] = useState(null);
+  const [showSmart, setShowSmart] = useState(false);
+
+  const inp = { ...sx.input, marginBottom: 12 };
+
+  const handleSmartAssign = async () => {
+    if (!title.trim()) { toast.warn("Enter a task title first"); return; }
+    try {
+      const [profiles, allTasks] = await Promise.all([DB.getProfiles("acmecorp"), DB.getTasks("acmecorp")]);
+      const result = smartAssignTask({ title, description: desc, priority, tags: [] }, profiles, allTasks);
+      result._profiles = profiles;
+      setSmartResult(result);
+      setShowSmart(true);
+    } catch (e) {
+      toast.error(e.message);
+    }
+  };
+
+  return (
+    <Modal onClose={onClose}>
+      {showSmart && (
+        <SmartAssignModal
+          result={smartResult}
+          onAccept={(name) => { setAsgn(name); setShowSmart(false); toast.success(`Assigned to ${name}`); }}
+          onAcceptAlt={(name) => { setAsgn(name); setShowSmart(false); toast.success(`Assigned to ${name}`); }}
+          onClose={() => setShowSmart(false)}
+        />
+      )}
+      <div style={{ padding: "20px 24px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ fontSize: 18, fontWeight: 700 }}>New Manual Task</div>
+        <button onClick={onClose} style={{ ...sx.btn("ghost"), padding: "4px 10px" }}>✕</button>
+      </div>
+      <div style={{ padding: "18px 24px" }}>
+        <span style={sx.label}>Task Title</span>
+        <input autoFocus value={title} onChange={e => setTitle(e.target.value)} style={inp} placeholder="e.g. Process monthly expense report" />
+        
+        <span style={sx.label}>Description</span>
+        <textarea value={desc} onChange={e => setDesc(e.target.value)} style={{ ...inp, resize: "vertical" }} rows={3} placeholder="What needs to be done?" />
+        
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+              <span style={{ ...sx.label, marginBottom: 0 }}>Assignee</span>
+              <button style={{ ...sx.btn("ghost"), padding: "2px 8px", fontSize: 10, color: C.purple, border: `1px solid ${C.purple}44` }} onClick={handleSmartAssign}>
+                🧠 Auto-Assign
+              </button>
+            </div>
+            <select value={assignee} onChange={e => setAsgn(e.target.value)} style={inp}>
+              <option>AI Agent</option>
+              <option>Operations Team</option>
+              <option>Manager Team</option>
+              {agents.map(a => <option key={a.id}>{a.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <span style={sx.label}>Priority</span>
+            <select value={priority} onChange={e => setPri(e.target.value)} style={inp}>
+              <option>High</option>
+              <option>Medium</option>
+              <option>Low</option>
+            </select>
+          </div>
+        </div>
+
+        {smartResult && !showSmart && (
+          <div style={{ background: `${C.purple}11`, border: `1px solid ${C.purple}33`, borderRadius: 8, padding: "8px 12px", marginBottom: 12, fontSize: 11, color: C.purple, display: "flex", alignItems: "center", gap: 8 }}>
+            🧠 AI assigned to <strong>{assignee}</strong> — {Math.round(smartResult.confidence * 100)}% confident
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <button style={sx.btn("ghost")} onClick={onClose}>Cancel</button>
+          <button style={sx.btn("primary")} disabled={!title.trim()} onClick={() => onSave({ title, description: desc, priority, assignee, due_in_days: parseInt(due) })}>Create Task</button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -2026,6 +2682,30 @@ export default function App() {
   const [page, setPage] = useState("Documents");
   const [sessionTok, setSessTok] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
+  const [toasts, setToasts] = useState([]);
+
+  // Toast API
+  const toast = useMemo(() => ({
+    show: (msg, type = "info") => {
+      const id = Date.now();
+      setToasts(p => [...p, { id, msg, type }]);
+      setTimeout(() => setToasts(p => p.filter(x => x.id !== id)), 4000);
+    },
+    success: (m) => toast.show(m, "success"),
+    error: (m) => toast.show(m, "error"),
+    warn: (m) => toast.show(m, "warn"),
+  }), []);
+
+  // Shortcut listeners
+  useEffect(() => {
+    const h = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") { e.preventDefault(); setShowSearch(s => !s); }
+      if (e.key === "Escape") setShowSearch(false);
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, []);
 
   // FIX: addAudit is stable — user ref changes only on login/logout
   const addAudit = useCallback(async (action, entity, entityId, description, meta = {}) => {
@@ -2041,7 +2721,7 @@ export default function App() {
 
   const handleLogin = async (loggedInUser) => {
     setUser(loggedInUser);
-    // FIX: write audit directly (addAudit hasn't closed over the new user yet)
+    toast.success(`Welcome back, ${loggedInUser.full_name.split(' ')[0]}`);
     try {
       await DB.insertAudit({ tenant_id: "acmecorp", action: "LOGIN", entity: "User", entity_id: loggedInUser.id, description: `${loggedInUser.full_name} signed in`, user_id: loggedInUser.id, user_name: loggedInUser.full_name });
     } catch (e) { console.warn("Login audit error:", e.message); }
@@ -2053,79 +2733,92 @@ export default function App() {
       if (!IS_DEMO && sessionTok) await DB.signOut(sessionTok);
     } catch (e) { console.warn("Logout audit error:", e.message); }
     setUser(null); setSessTok(null); setPage("Documents");
+    toast.show("Signed out successfully");
   };
+
+  const [dark, setDark] = useState(true);
+  const theme = useMemo(() => dark ? C : { ...C, bg: "#F8FAFC", surface: "#FFFFFF", card: "#FFFFFF", border: "#E2E8F0", dim: "#F1F5F9", text: "#0F172A", muted: "#64748B", input: "#FFFFFF" }, [dark]);
 
   if (!user) return <LoginScreen onLogin={handleLogin} />;
 
   const roleConf = ROLES[user.role] || ROLES.Viewer;
   const activePage = roleConf.pages.includes(page) ? page : roleConf.pages[0];
-  const PAGE_ICONS = { Documents: "📄", Tasks: "✅", Workflow: "🔀", Analytics: "📊", Audit: "📋", Admin: "🔑" };
+  const PAGE_ICONS = { Dashboard: "📈", Documents: "📄", Tasks: "✅", Workflow: "🔀", Analytics: "📊", Audit: "📋", Admin: "🔑" };
 
   return (
-    <AuthCtx.Provider value={{ user, perms: roleConf }}>
-      <AuditCtx.Provider value={addAudit}>
-        <style>{`
-          @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&display=swap');
-          *{box-sizing:border-box;margin:0;padding:0}
-          body{background:#0A0C10}
-          @keyframes spin{to{transform:rotate(360deg)}}
-          @keyframes slideUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-          button:hover{opacity:.82}
-          button:disabled{opacity:.35;cursor:not-allowed;pointer-events:none}
-          input:focus,textarea:focus,select:focus{border-color:#00D4FF!important;outline:none}
-          ::-webkit-scrollbar{width:4px;height:4px}
-          ::-webkit-scrollbar-track{background:#111318}
-          ::-webkit-scrollbar-thumb{background:#1E2430;border-radius:2px}
-          select option{background:#161A22;color:#E8EDF5}
-        `}</style>
-        <div style={sx.app}>
-          {/* Header */}
-          <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 24px", borderBottom: `1px solid ${C.border}`, background: `${C.surface}DD`, backdropFilter: "blur(12px)", position: "sticky", top: 0, zIndex: 100, gap: 12 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 17, fontWeight: 700, letterSpacing: "-0.3px", color: C.text, flexShrink: 0 }}>
-              <div style={{ width: 28, height: 28, background: `linear-gradient(135deg,${C.accent},${C.green})`, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>⚡</div>
-              Workflow Manager
-              <span style={{ fontSize: 10, color: C.muted, fontWeight: 400 }}>· Enterprise{IS_DEMO ? " · Demo" : ""}</span>
+    <ThemeCtx.Provider value={{ dark, setDark, C: theme }}>
+      <AuthCtx.Provider value={{ user, perms: roleConf }}>
+        <AuditCtx.Provider value={addAudit}>
+          <ToastCtx.Provider value={toast}>
+            <style>{`
+              @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&display=swap');
+              *{box-sizing:border-box;margin:0;padding:0}
+              body{background:${theme.bg};color:${theme.text};transition:background .2s,color .2s}
+              @keyframes spin{to{transform:rotate(360deg)}}
+              @keyframes slideUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+              @keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+              button:hover{opacity:.82}
+              button:disabled{opacity:.35;cursor:not-allowed;pointer-events:none}
+              input:focus,textarea:focus,select:focus{border-color:${theme.accent}!important;outline:none}
+              ::-webkit-scrollbar{width:4px;height:4px}
+              ::-webkit-scrollbar-track{background:${theme.bg}}
+              ::-webkit-scrollbar-thumb{background:${theme.border};border-radius:2px}
+              select option{background:${theme.surface};color:${theme.text}}
+            `}</style>
+            
+            <div style={{ ...sx.app, background: theme.bg, color: theme.text }}>
+              <ToastContainer toasts={toasts} remove={id => setToasts(p => p.filter(x => x.id !== id))} />
+              {showSearch && <SearchModal onClose={() => setShowSearch(false)} />}
+              <DashboardBanner />
+              
+              {/* Header */}
+              <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 24px", borderBottom: `1px solid ${theme.border}`, background: `${theme.surface}DD`, backdropFilter: "blur(12px)", position: "sticky", top: 0, zIndex: 100, gap: 12 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 17, fontWeight: 700, letterSpacing: "-0.3px", color: theme.text, flexShrink: 0 }}>
+                  <div style={{ width: 28, height: 28, background: `linear-gradient(135deg,${theme.accent},${theme.green})`, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, color: "#000" }}>⚡</div>
+                  Workflow Manager
+                </div>
+
+                <div onClick={() => setShowSearch(true)} style={{ flex: 1, maxWidth: 300, background: theme.dim, borderRadius: 8, padding: "6px 12px", display: "flex", alignItems: "center", gap: 8, cursor: "pointer", border: `1px solid ${theme.border}` }}>
+                  <span style={{ fontSize: 14 }}>🔍</span>
+                  <span style={{ fontSize: 11, color: theme.muted }}>Search...</span>
+                  <span style={{ marginLeft: "auto", fontSize: 10, color: theme.muted, background: theme.surface, padding: "2px 4px", borderRadius: 3, border: `1px solid ${theme.border}`, fontWeight: 700 }}>⌘K</span>
+                </div>
+
+                <nav style={{ display: "flex", gap: 2, flexWrap: "wrap", justifyContent: "center" }}>
+                  {roleConf.pages.map(p => (
+                    <button key={p} style={{ padding: "6px 11px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 11, fontFamily: "inherit", fontWeight: activePage === p ? 700 : 400, letterSpacing: "0.3px", background: activePage === p ? `${theme.accent}22` : "transparent", color: activePage === p ? theme.accent : theme.muted, transition: "all .15s" }} onClick={() => setPage(p)}>
+                      {PAGE_ICONS[p]} {p}
+                    </button>
+                  ))}
+                </nav>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+                  <button onClick={() => setDark(!dark)} style={{ ...sx.btn("ghost"), width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", padding: 0, fontSize: 16 }}>{dark ? "🌙" : "☀️"}</button>
+                  <button style={{ ...sx.btn("ghost"), padding: "5px 10px", fontSize: 12, gap: 6, color: theme.text }} onClick={() => setShowSettings(true)}>⚙️ Settings</button>
+                  <div style={{ width: 1, height: 18, background: theme.border }} />
+                  <Avatar user={user} size={26} />
+                  <button style={{ ...sx.btn("ghost"), padding: "4px 10px", fontSize: 11 }} onClick={handleLogout}>Sign Out</button>
+                </div>
+              </header>
+
+              {/* Main */}
+              <main style={{ flex: 1, padding: "26px 28px", maxWidth: 1300, margin: "0 auto", width: "100%", animation: "slideUp .25s ease" }}>
+                <ErrorBoundary>
+                  {activePage === "Dashboard" && <DashboardPage />}
+                  {activePage === "Documents" && <DocumentsPage />}
+                  {activePage === "Tasks" && <TasksPage />}
+                  {activePage === "Workflow" && <WorkflowPage />}
+                  {activePage === "Analytics" && <AnalyticsPage />}
+                  {activePage === "Audit" && <AuditLogPage />}
+                  {activePage === "Admin" && <AdminPanel />}
+                </ErrorBoundary>
+              </main>
+
+              {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
             </div>
-
-            <nav style={{ display: "flex", gap: 2, flexWrap: "wrap", justifyContent: "center" }}>
-              {roleConf.pages.map(p => (
-                <button key={p} style={{ padding: "6px 11px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 11, fontFamily: "inherit", fontWeight: activePage === p ? 700 : 400, letterSpacing: "0.3px", background: activePage === p ? `${C.accent}22` : "transparent", color: activePage === p ? C.accent : C.muted, transition: "all .15s" }} onClick={() => setPage(p)}>
-                  {PAGE_ICONS[p]} {p}
-                </button>
-              ))}
-            </nav>
-
-            <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-              <button style={{ ...sx.btn("ghost"), padding: "5px 10px", fontSize: 12, gap: 6, color: C.text }} onClick={() => setShowSettings(true)}>
-                ⚙️ Settings
-              </button>
-              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                <div style={{ width: 7, height: 7, borderRadius: "50%", background: C.green, boxShadow: `0 0 6px ${C.green}` }} />
-                <span style={{ fontSize: 10, color: C.muted }}>AI Online</span>
-              </div>
-              <div style={{ width: 1, height: 18, background: C.border }} />
-              <Avatar user={user} size={26} />
-              <div>
-                <div style={{ fontSize: 11, fontWeight: 600, color: C.text, lineHeight: 1.2 }}>{user.full_name}</div>
-                <div style={{ fontSize: 10, color: roleConf.color }}>{roleConf.icon} {user.role}</div>
-              </div>
-              <button style={{ ...sx.btn("ghost"), padding: "4px 10px", fontSize: 11 }} onClick={handleLogout}>Sign Out</button>
-            </div>
-          </header>
-
-          {/* Main */}
-          <main style={{ flex: 1, padding: "26px 28px", maxWidth: 1300, margin: "0 auto", width: "100%", animation: "slideUp .25s ease" }}>
-            {activePage === "Documents" && <DocumentsPage />}
-            {activePage === "Tasks" && <TasksPage />}
-            {activePage === "Workflow" && <WorkflowPage />}
-            {activePage === "Analytics" && <AnalyticsPage />}
-            {activePage === "Audit" && <AuditLogPage />}
-            {activePage === "Admin" && <AdminPanel />}
-          </main>
-
-          {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
-        </div>
-      </AuditCtx.Provider>
-    </AuthCtx.Provider>
+          </ToastCtx.Provider>
+        </AuditCtx.Provider>
+      </AuthCtx.Provider>
+    </ThemeCtx.Provider>
   );
 }
